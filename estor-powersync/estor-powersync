@@ -1,0 +1,442 @@
+#!/bin/bash
+#
+# developed by jacknam@ellucy.com
+#
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin:/usr/local/sbin
+VERSION=1.0
+ESTOR_PATH="/opt/ellucy/estor"
+POWERSYNC_PATH="$ESTOR_PATH/powersync"
+POWERSYNC_LOG="$POWERSYNC_PATH/estor_powersync.log"
+POWERSYNC_CONF="$POWERSYNC_PATH/estor_powersync.conf"
+POWERSYNC_KEY_PATH="$POWERSYNC_PATH/ssh_key"
+command="$1"
+
+[ ! -d $ESTOR_PATH ] && mkdir -p "$ESTOR_PATH"
+[ ! -d $POWERSYNC_PATH ] && mkdir -p "$POWERSYNC_PATH"
+[ ! -d $POWERSYNC_KEY_PATH ] && mkdir -p "$POWERSYNC_KEY_PATH"
+[ -f $POWERSYNC_CONF ] && . $POWERSYNC_CONF
+
+logging() {
+ local log="$1"
+ echo "[`date '+%Y-%m-%d %H:%M:%S'`] ${log}" >> "$POWERSYNC_LOG"
+ return 0
+}
+
+get_action() {
+ local targets=$(systemctl list-jobs 2> /dev/null)
+ #if ! echo "$targets" | grep -q "shutdown.target"; then
+  #return 0
+ #fi
+
+ if echo "$targets" | grep -q "reboot.target"; then
+  echo "reboot"
+ else
+  echo "shutdown"
+ fi
+
+ return 0
+}
+
+ssh_key_copy() {
+ local client_ip="$1"
+ local client_port="$2"
+ local client_uid="$3"
+ local action="$4"
+ if [ -z "$client_ip" ] || [ -z "$client_port" ] || [ -z "$client_uid" ]; then
+  return 1
+ fi
+
+ local ssh_key_path="${POWERSYNC_KEY_PATH}/${client_uid}@${client_ip}:${client_port}"
+ if [ "$action" = "delete" ]; then
+  [ -d "$ssh_key_path" ] && rm -rf "$ssh_key_path"
+  return 0
+ fi
+
+ if [ ! -f "/root/.ssh/id_rsa" ]; then
+  ssh-keygen -t rsa -b 2048
+ fi
+
+ if [ ! -d "$ssh_key_path" ]; then
+  read -t 5 -rp "> Would you like to copy ssh key to ${client_ip}? (y|N) : " answer < /dev/tty
+  [ -z "$answer" ] && echo ""
+  [ "$(echo "$answer" | awk '{ print tolower($0); }')" != "y" ] && return 1
+  if ssh-copy-id "${client_uid}@${client_ip}" -p "${client_port}"; then
+   mkdir "$ssh_key_path"
+  else
+   return 1
+  fi
+ fi
+
+ return 0
+}
+
+make_sudo_shutdown() {
+ local client_ip="$1"
+ local client_port="$2"
+ local client_uid="$3"
+ local action="$4"
+ if [ -z "$client_ip" ] || [ -z "$client_uid" ] || [ -z "$client_port" ]; then
+  return 1
+ fi
+
+ local ssh_key_path="${POWERSYNC_KEY_PATH}/${client_uid}@${client_ip}:${client_port}"
+ [ ! -d "$ssh_key_path" ] && return 1
+
+ local sudo_shutdown_name="sudo_shutdown_${client_uid}"
+ local sudo_shutdown_file="${ssh_key_path}/${sudo_shutdown_name}"
+ if [ -f "$sudo_shutdown_file" ]; then
+  if [ "$action" = "delete" ]; then
+   ssh -t -o ConnectTimeout=3 -p "${client_port}" "${client_uid}@${client_ip}" "sudo rm -f /etc/sudoers.d/${sudo_shutdown_name}"
+  fi
+  return 0
+ else
+  if [ "$action" = "check" ]; then
+   return 1
+  fi
+
+  echo "${client_uid} ALL=NOPASSWD:/sbin/shutdown" > "$sudo_shutdown_file"
+  chmod 0440 "$sudo_shutdown_file"
+
+  local remote_file="/home/${client_uid}/${sudo_shutdown_name}"
+  if rsync -a -e "ssh -p ${client_port} -o ConnectTimeout=5" --timeout=10 --delete --rsync-path="rsync" "$sudo_shutdown_file" "${client_uid}@${client_ip}:${remote_file}"; then
+   if ssh -t -o ConnectTimeout=3 -p "${client_port}" "${client_uid}@${client_ip}" "sudo mv -f ${remote_file} /etc/sudoers.d/ && sudo chown root:root /etc/sudoers.d/${sudo_shutdown_name}"; then
+    return 0
+   fi
+  fi
+
+  rm -f "$sudo_shutdown_file"
+  return 1
+ fi
+
+ return 0
+}
+
+limit_log() {
+ [ -z "$POWERSYNC_LOG" -o ! -f "$POWERSYNC_LOG" ] && return 1
+
+ [ -z "$log_limit" ] && log_limit=5000
+ local log_count=$(wc -l < $POWERSYNC_LOG | xargs)
+
+ if [ "$log_count" -gt "$log_limit" ]; then
+  tail "-$(($log_limit / 2))" $POWERSYNC_LOG > $POWERSYNC_LOG.tmp
+  mv $POWERSYNC_LOG.tmp $POWERSYNC_LOG
+ fi
+
+ return 0
+}
+
+wakeup_estor() {
+ local action_type="$1"
+ local target_ip="$2"
+ local clients=$(cat "$POWERSYNC_CONF" 2>/dev/null | grep "^#client_.*=")
+ [ -z "$clients" ] && return 0
+
+ if [ "$action_type" = "manual" ]; then
+  if [ -n "$target_ip" ]; then
+   clients=$(echo "$clients" | grep "$target_ip")
+   [ -z "$clients" ] && return 1
+  fi
+ else
+  if [ "$powersync" != "on" ]; then
+   return 0
+  fi
+ fi
+
+ local ifconfigs=$(ifconfig 2>/dev/null)
+ [ -z "$ifconfigs" ] && return 1
+
+ local client=""
+ local iface=""
+ local client_hostname=""
+ local client_ip=""
+ local client_mac=""
+ for client in $clients; do
+  client=$(echo "$client" | cut -d"=" -f2-)
+  oIFS="$IFS"; IFS="|"; vals=($client); IFS="$oIFS"
+  client_hostname="${vals[0]}"
+  client_ip="${vals[1]}"
+  client_mac="${vals[4]}"
+  [ -z "$client_ip" -o -z "$client_mac" ] && continue
+  check_client $client_ip && continue
+
+  #iface=$(echo "$ifconfigs" | grep -B1 "inet $(echo $client_ip | cut -d"." -f1-3)." | grep -E "^[u|e|t|b].*mtu" | cut -d":" -f1)
+  iface=$(echo "$ifconfigs" | grep -B1 "inet $(echo $client_ip | cut -d"." -f1-3)." | grep -m1 " mtu " | cut -d":" -f1)
+  etherwake -i "$iface" "$client_mac"
+
+  logging "`hostname` waked-up $client_hostname at $client_ip"
+ done
+ limit_log
+
+ return 0
+}
+
+shutdown_estor() {
+ local action_type="$1"
+ local target_ip="$2"
+ local clients=$(cat "$POWERSYNC_CONF" 2>/dev/null | grep "^#client_.*=")
+ [ -z "$clients" ] && return 0
+
+ if [ "$action_type" = "manual" ]; then
+  if [ -n "$target_ip" ]; then
+   clients=$(echo "$clients" | grep "$target_ip")
+   [ -z "$clients" ] && return 1
+  fi
+ else
+  local system_action=$(get_action)
+  if [ "$system_action" = "shutdown" ]; then
+   logging "`hostname` system is about shutting down"
+  elif [ "$system_action" = "reboot" ]; then
+   logging "`hostname` system is about rebooting"
+   return 0
+  else
+   return 1
+  fi
+
+  if [ "$powersync" != "on" ]; then
+   return 0
+  fi
+ fi
+
+ local wait_min=${waitmin:-1}
+ local client=""
+ local client_hostname=""
+ local client_ip=""
+ local client_port=""
+ local client_uid=""
+ for client in $clients; do
+  client=$(echo "$client" | cut -d"=" -f2-)
+  oIFS="$IFS"; IFS="|"; vals=($client); IFS="$oIFS"
+  client_hostname="${vals[0]}"
+  client_ip="${vals[1]}"
+  client_port="${vals[2]}"
+  client_uid="${vals[3]}"
+
+  echo "$client_ip $client_port $client_uid"
+
+  [ -z "$client_ip" -o -z "$client_port" -o -z "$client_uid" ] && continue
+  check_client $client_ip || continue
+
+  echo hey
+  make_sudo_shutdown "$client_ip" "$client_port" "$client_uid" check || continue
+  ssh -t -o ConnectTimeout=3 -p "${client_port}" "${client_uid}@${client_ip}" "sudo shutdown -h ${wait_min}"
+  logging "`hostname` shutdown $client_hostname at $client_ip"
+ done
+ limit_log
+
+ return 0
+}
+
+check_client() {
+ local client_ip="$1"
+ ping -q -w1 -c1 $client_ip > /dev/null 2>&1 && return 0
+
+ return 1
+}
+
+set_systemd() {
+ local action="$1"
+ local systemd_file="/etc/systemd/system/estor-powersync.service"
+
+ if [ "$action" = "regist" ]; then
+  if [ -f "$systemd_file" ]; then
+   echo "The systemd file of ESTOR Power-Sync already registered"
+   return 0
+  fi
+
+cat << "EOF" > "$systemd_file"
+[Unit]
+Description=Wakeup and Shutdown ESTOR storage
+Before=shutdown.target
+Wants=network-online.target
+After=network.target network-online.target
+Requires=network.target
+Conflicts=reboot.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/estor-powersync wakeup
+ExecStop=/usr/local/sbin/estor-powersync shutdown
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  chmod 664 "$systemd_file"
+  systemctl enable estor-powersync.service
+ elif [ "$action" = "remove" ]; then
+  if [ ! -f "$systemd_file" ]; then
+   echo "The systemd file of ESTOR Power-Sync not registered"
+   return 0
+  fi
+  rm -f "$systemd_file"
+ else
+  echo "systemd command invalid (should be 'regist' or 'remove'"
+  return 1
+ fi
+
+ echo "The action '$action' of systemd file for ESTOR Power-Sync completed"
+ systemctl daemon-reload
+ return 0
+}
+
+set_storage() {
+ local ip=$(echo "$1" | grep -oE "[1-9]{1}[0-9]{0,2}\.([0-9]{1,3}\.){2}[1-9%]{1}[0-9]{0,2}")
+ local uid="$2"
+ if [ -z "$ip" ] || [ -z "$uid" ]; then
+  echo "Storage IP or User ID is missing"
+  return 1
+ fi
+
+ local port=$(echo "$3" | egrep "^[0-9]{1,5}$")
+ [ -z "$port" ] && port=22
+
+ local client_id="client_$(echo "$ip" | sed 's/\./_/g')"
+ if [ "$uid" = "delete" ]; then
+  local ex_conf=$(cat "$POWERSYNC_CONF" 2>/dev/null | grep "^#${client_id}=")
+  if [ -z "$ex_conf" ]; then
+   echo "Storage at $ip has not been set for powersync"
+  else
+   local client=$(echo "$ex_conf" | cut -d"=" -f2-)
+   oIFS="$IFS"; IFS="|"; vals=($client); IFS="$oIFS"
+   make_sudo_shutdown "${vals[1]}" "${vals[2]}" "${vals[3]}" delete
+   ssh_key_copy "${vals[1]}" "${vals[2]}" "${vals[3]}" delete
+   sed -i "/#${client_id}=/d" "$POWERSYNC_CONF"
+   echo "Storage at $ip has been removed for powersync"
+   logging "estor client ${vals[0]} at ${vals[3]}@${vals[1]}:${vals[2]} has been removed for powersync"
+  fi
+  return 0
+ fi
+
+ if ! check_client $ip; then
+  echo "Storage IP is invalid or server down"
+  return 1
+ fi
+
+ local ip_info=$(ssh -t -o ConnectTimeout=3 -p "${port}" "${uid}@${ip}" "/usr/sbin/ifconfig 2>/dev/null | grep -A2 'inet $ip'" 2>/dev/null)
+ if [ -z "$ip_info" ]; then
+  echo "Can't retrieve Storage IP info"
+  return 1
+ fi
+
+ local mac=$(echo "$ip_info" | grep "ether.*Ethernet" | awk '{print $2;}')
+ if [ -z "$mac" ]; then
+  echo "Can't retrieve Storage MAC address"
+  return 1
+ fi
+
+ if ! ssh_key_copy "$ip" "$port" "$uid"; then
+  echo "Can't complete ssh key copy"
+  return 1
+ fi
+
+ local host=$(ssh -t -o ConnectTimeout=3 -p "${port}" "${uid}@${ip}" "hostname" 2>/dev/null)
+ if [ -z "$host" ]; then
+  echo "Can't retrieve Storage hostname"
+  return 1
+ fi
+ host=$(echo "$host" | grep -oE "[a-zA-Z0-9.-]+" | xargs | sed 's/ //g')
+
+ if ! make_sudo_shutdown "$ip" "$port" "$uid"; then
+  echo "Can't set remote shutdown on Storage"
+  return 1
+ fi
+
+ local conf=$(cat "$POWERSYNC_CONF" 2>/dev/null | grep -v "^#${client_id}=" | grep -v "^$")
+ conf+="\n#${client_id}=${host}|${ip}|${port}|${uid}|${mac}"
+ echo -e "$conf" > "$POWERSYNC_CONF"
+
+ logging "estor client $host at ${uid}@${ip}:${port} has been setup for powersync"
+ echo "Storage Client Setup Summary
+Hostname: $host
+IP: $ip
+Port: $port
+UserID: $uid
+MAC: $mac"
+
+ return 0
+}
+
+set_conf() {
+ local key="$1"
+ local val="$2"
+
+ if echo "$key" | grep -qE "[[:space:]]"; then
+  echo "[Error] The set key must not have any space"
+  return 1
+ fi
+
+ if [ "$key" = "systemd" ]; then
+  set_systemd "$val"
+  return 0
+ else
+  if [ "$key" = "powersync" ]; then
+   val=$(echo "$val" | grep -E "^(on|off)$")
+  elif [ "$key" = "waitmin" ]; then
+   val=$(echo "$val" | grep -E "^[1-9]$")
+  fi
+
+  if [ -z "$val" ]; then
+   echo "[Error] The value is invalid. Please refere to help"
+   return 1
+  fi
+
+  local conf=$(cat "$POWERSYNC_CONF" 2>/dev/null | grep -v "^${key}=" | grep -v "^$")
+  conf+="\n${key}=\"$val\""
+  echo -e "$conf" > "$POWERSYNC_CONF"
+  echo "Config '$key=\"$val\"' written in $POWERSYNC_CONF"
+ fi
+
+ return 0
+}
+
+help() {
+echo "Ellucy Storage ESTOR Power-Sync $VERSION
+Copyright: Jack Nam (jacknam@ellucy.com)
+
+Reference:
+Config : $POWERSYNC_CONF
+Log    : $POWERSYNC_LOG
+
+Required:
+etherwake, ssh, ssh-keygen, ssh-copy-id, rsync
+
+Commands:
+wakeup (manual) (ip)                    wakeup estor storage (force manually) (target ip)
+shutdown (manual) (ip)                  shutdown estor storage (force manually) (target ip)
+setup ip (user_id|delete) (port|none)   set remote estor storage (if delete, set 'delete' instead of user_id)
+set key value                           set config value (powersync [on|off]|systemd [regist|remove]|waitmin [1-9])
+help                                    help usage
+
+Current Configs:
+"
+ if [ -f "$POWERSYNC_CONF" ]; then
+  cat $POWERSYNC_CONF
+ else
+  echo "No configs defined yet"
+ fi
+
+ return 0
+}
+
+case "$command" in
+ wakeup)
+  wakeup_estor "${@:2}"
+  ;;
+ shutdown)
+  shutdown_estor "${@:2}"
+  ;;
+ set)
+  set_conf "${@:2}"
+  ;;
+ setup)
+  set_storage "${@:2}"
+  ;;
+ help)
+  help
+  ;;
+ *)
+  echo "Ellucy Storage ESTOR Power-Sync $VERSION"
+esac
+
+exit 0

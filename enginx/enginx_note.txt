@@ -1,0 +1,6 @@
+# https://www.linuxcapable.com/how-to-install-latest-nginx-mainline-or-stable-on-debian-11/
+http://nginx.org/en/linux_packages.html#Debian
+https://computingforgeeks.com/how-to-install-latest-php-on-debian/
+
+
+curl -sSL https://packages.sury.org/nginx/README.txt | sudo bash -x

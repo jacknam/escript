@@ -1,0 +1,1152 @@
+#!/bin/bash
+#
+# developed by jacknam@ellucy.com
+#
+VERSION=1.0
+ESYNC_PATH="/etc/esync"
+ESYNC_PRESET_PATH="$ESYNC_PATH/preset"
+ESYNC_KEY_PATH="$ESYNC_PATH/ssh_key"
+ESYNC_CONFIG="${ESYNC_PATH}/esync.conf"
+ESYNC_LOG="${ESYNC_PATH}/esync.log"
+command="$1"
+
+exists() {
+ command -v "$1" >/dev/null 2>&1
+}
+
+check_internet() {
+ if ip route 2>/dev/null | grep -q default; then
+  nc -zw1 1.1.1.1 53 >/dev/null 2>&1 && return 0
+ fi
+ return 1
+}
+
+validate_ip() {
+ local ip="$1"
+ [ -z "$ip" ] && return 1
+
+ if echo "$ip" | grep -q "[a-zA-Z]"; then
+  if ! exists dig; then
+   if [ -f "/etc/apt/sources.list" ]; then
+    apt-get -qq update && apt-get install -y -q dnsutils
+   elif [ -d "/etc/yum.repos.d" ]; then
+    yum -y -q update && yum -y -q install bind-utils
+   fi
+  fi
+  ip=$(dig +short "$ip" 2>/dev/null)
+ fi
+
+ ip=$(echo "$ip" | grep -oE "[1-9]{1}[0-9]{0,2}\.([0-9]{1,3}\.){2}[1-9%]{1}[0-9]{0,2}")
+ echo "$ip" | xargs
+ return 0
+}
+
+validate_port() {
+ local port="$1"
+ [ -z "$port" ] && return 1
+
+ port=$(echo "$port" | egrep "^[0-9]{1,5}$")
+ echo "$port" | xargs
+ return 0
+}
+
+host_check() {
+ local target="$1"
+ local host_addr=$(validate_ip "$2")
+ local host_rootpath="$3"
+ local host_id="$4"
+ local host_port=$(validate_port "$5")
+ if [ -z "$target" ] || [ -z "$host_addr" ] || [ -z "$host_rootpath" ] || [ -z "$host_id" ] || [ -z "$host_port" ]; then
+  return 1
+ fi
+
+ nc -zw1 ${host_addr} ${host_port} >/dev/null 2>&1 || return 1
+
+ local short_check="$6"
+ if [ "$short_check" = "true" ]; then
+  return 0
+ fi
+
+ local owner=$(bash -c "ssh -p ${host_port} ${host_id}@${host_addr} 'stat -c \"%U\" /${host_rootpath}/${target} 2>/dev/null'")
+ if [ "${owner}" = "${host_id}" ]; then
+  return 0
+ fi
+
+ return 1
+}
+
+host_setup() {
+ local action="$1"
+ local error_msg=""
+ local host_user=${ESYNC_HOST_ID:-$(who am i | head -1 | cut -d" " -f1)}
+ if [ "$action" = "check" ]; then
+  if [ "$ESYNC_HOST_MODE" = "true" ]; then
+   if [ -z "$ESYNC_HOST_PATH" ] || [ ! -d "$ESYNC_HOST_PATH" ]; then
+    error_msg="[WARN] You need to specify esync host path first"
+    ESYNC_HOST_PATH=""
+    ESYNC_HOST_MODE="false"
+    ESYNC_HOST_SUDO="false"
+    ESYNC_HOST_ID=""
+   else
+    ESYNC_HOST_ID="$host_user"
+   fi
+  else
+   ESYNC_HOST_SUDO="false"
+  fi
+
+  local rsync_sudo_id_log="${ESYNC_KEY_PATH}/.rsync_sudo_id"
+  local rsync_sudo_id=$(cat "${rsync_sudo_id_log}" 2>/dev/null | xargs)
+  if [ "$ESYNC_HOST_SUDO" = "true" ]; then
+   if [ -n "$rsync_sudo_id" ] && [ "$rsync_sudo_id" != "$host_user" ]; then
+    sed -i "s/^${rsync_sudo_id}.*rsync$//" /etc/sudoers
+   fi
+   if ! grep -q "^${host_user}.*rsync$" /etc/sudoers; then
+    echo "${host_user} ALL=NOPASSWD:/usr/bin/rsync" >> /etc/sudoers
+    echo "${host_user}" > "$rsync_sudo_id_log"
+   fi
+  else
+   if [ -n "$rsync_sudo_id" ]; then
+    if grep -q "^${rsync_sudo_id}.*rsync$" /etc/sudoers; then
+     sed -i "s/^${rsync_sudo_id}.*rsync$//" /etc/sudoers
+    fi
+    rm -f "$rsync_sudo_id_log"
+   fi
+  fi
+
+  if [ -n "$error_msg" ]; then
+   echo "$error_msg"
+   return 1
+  fi
+ elif [ "$action" = "mkroot" ]; then
+  local root_path="$2"
+  if [ -n "$root_path" ] && [ ! -d "$root_path" ]; then
+   mkdir -p "$root_path"
+  fi
+ elif [ "$action" = "set" ]; then
+  if [ "$ESYNC_HOST_MODE" != "true" ]; then
+   echo "[ERROR] Host mode disabled"
+   return 1
+  fi
+  if [ -z "$ESYNC_HOST_PATH" ] || [ ! -d "$ESYNC_HOST_PATH" ]; then
+   echo "[ERROR] No esync host path"
+   return 1
+  fi
+  local target="$2"
+  if [ -z "$target" ] || [ -n "$(echo "$target" | grep -q "/")" ]; then
+   echo "[ERROR] No target repo (slash not accepted)"
+   return 1
+  fi
+  local target_path="${ESYNC_HOST_PATH}/${target}"
+  if [ -d "$target_path" ]; then
+   local owner=$(stat -c "%U" ${target_path})
+   if [ "$owner" != "$host_user" ]; then
+    chown -R ${host_user}:${host_user} "$target_path"
+   fi
+  else
+   mkdir -p "$target_path"
+   chown -R ${host_user}:${host_user} "$target_path"
+  fi
+  echo "[INFO] target repo has been set at $target_path"
+ else
+  if [ "$ESYNC_HOST_MODE" = "true" ]; then
+   local rsync_ip=$(ip address | grep "scope global" | awk '{ print $2; }' | cut -d"/" -f1 | xargs)
+   local example_ip=$(echo $rsync_ip | cut -d" " -f1)
+   local rsync_port=$(cat /etc/ssh/sshd_config | grep "^Port" | head -1 | cut -d" " -f2)
+   local list=$(find "${ESYNC_HOST_PATH}" -maxdepth 1 -mindepth 1 -type d -printf '%f\n')
+printf "[Ellucy esync host info]
+
+1. Remote info:
+ip: %s
+port: %s
+user_id: %s
+
+2. Sudo mode:
+%s
+
+3. Root path:
+%s
+
+4. Target Repo List:
+%s
+
+" "${rsync_ip}" "${rsync_port}" "${host_user}" "${ESYNC_HOST_SUDO:-false}" "${ESYNC_HOST_PATH}" "${list}"
+  else
+   echo "Host mode disabled"
+  fi
+ fi
+
+ return 0
+}
+
+size_byte() {
+ local size=$(echo "$1" | grep -oE "^[0-9.]*")
+ local unit=$(echo "$1" | grep -oE "(K|M|G)$")
+ if [ "$unit" = "K" ]; then
+  awk "BEGIN {printf \"%d\n\", $size*1024}"
+ elif [ "$unit" = "M" ]; then
+  awk "BEGIN {printf \"%d\n\", $size*1024*1024}"
+ elif [ "$unit" = "G" ]; then
+  awk "BEGIN {printf \"%d\n\", $size*1024*1024*1024}"
+ else
+  awk "BEGIN {printf \"%d\n\", $size}"
+ fi
+
+ return 0
+}
+
+get_rsyncinfo() {
+ local stat_data=$(echo "$1" | grep -E "^(Number of.*:|Total.*size:)")
+ [ -z "$stat_data" ] && return 1
+
+ IFS=$'\n'; stat_data=( ${stat_data} ); unset IFS
+ [ "${#stat_data[@]}" != "6" ] && return 1
+
+ local action=$(echo ${2^})
+ echo "[${action} Target Stat]"
+ echo "${stat_data[4]}"
+ echo "${stat_data[0]}"
+ echo "[${action} Transfer Detail]"
+ echo "${stat_data[5]}"
+ echo "${stat_data[3]}"
+ echo "${stat_data[1]}"
+ echo "${stat_data[2]}"
+
+ local human_size=""
+ local human_count=""
+ local approx_time=""
+ local value=""
+ local rsync_brief="[rsync_brief]"
+ for i in 0 4 3 5; do
+  value=$(echo "${stat_data[$i]}" | cut -d":" -f2 | awk '{ print $1; }')
+  [ "$i" = "3" ] && human_count="$value"
+  [ "$i" = "5" ] && human_size="$value"
+  value=$(size_byte "$value")
+  [ "$i" = "5" ] && approx_time="$value"
+  rsync_brief+=" ${value}"
+ done
+ rsync_brief+=" ${human_count}"
+ rsync_brief+=" ${human_size}"
+ approx_time=$(awk "BEGIN {printf \"%d\n\", ${approx_time}/31457280/60}")
+ rsync_brief+=" ${approx_time}"
+
+ # 0: total count, 1: total byte size, 2: transfer count, 3: transfer byte size, 4: transfer human count, 5: transfer human size, 6: approx. time (min)
+ echo "$rsync_brief"
+ return 0
+}
+
+get_detail() {
+ local conf_file="$1"
+ [ -z "$conf_file" ] && return 1
+
+ conf_file=$(echo "$conf_file" | cut -d":" -f2 | xargs)
+ [ ! -f "$conf_file" ] && return 1
+
+ local detail=""
+ IFS=$'\n'; for line in $(cat "$conf_file" | grep "^\["); do
+  if [ "${line:1:10}" = "esync_host" ]; then
+   detail+=$(echo "$line" | cut -d"|" -f2)":"
+  else
+   detail+=$(echo "$line" | cut -d"|" -f1)
+  fi
+  detail+=" "
+ done; unset IFS
+ echo "$detail" | xargs
+
+ return 0
+}
+
+edit_target() {
+ local target="$1"
+ local option=""
+ local filter=""
+ local confirm=""
+
+ if [ -n "$target" ] && [ -f "${ESYNC_PRESET_PATH}/${target}.conf" ]; then
+  nano "${ESYNC_PRESET_PATH}/${target}.conf"
+  return 0
+ fi
+
+ echo -e "\nEllucy esync target edit\n"
+ local list=$(find "$ESYNC_PRESET_PATH" -type f -name "*.conf" -printf '%f: %p\n' 2>/dev/null | sed "s/\.conf\:/ :/")
+ if [ -n "$list" ]; then
+  option="[number/(n)ew/(d)elete/(c)ancel]: "
+  filter="^([0-9]*|n|d|c)$"
+  confirm="> Please type a number of target to edit or command letter"
+  echo "* current target list"
+  local detail=""
+  local number=0
+  IFS=$'\n'; for line in ${list}; do
+   (( number++ ))
+   detail=$(get_detail "$line")
+   echo "[$number] $line : $detail"
+  done; unset IFS
+ else
+  option="[(n)ew/(c)ancel]: "
+  filter="^(n|c)$"
+  confirm="> Please create a new target"
+  echo "* there is no target"
+ fi
+
+ echo -n -e "\n$confirm $option"
+ local answer=""
+ while [ -z "$answer" ]; do
+  read answer < /dev/tty
+  answer=$(echo "$answer" | egrep "$filter")
+  if [ -z "$answer" ]; then
+   echo -n "> Please enter a valid option $option"
+  fi
+ done
+
+ local taget_file=""
+ if [ "$answer" = "c" ]; then
+  echo "> target editing has been cancelled"
+ elif [ "$answer" = "d" ]; then
+  option="[number/(c)ancel]: "
+  filter="^([0-9]*|c)$"
+  confirm="> Please type the number of target to delete"
+  echo -n "$confirm $option"
+  local deleting_target=""
+  answer=""
+  while [ -z "$answer" ]; do
+   read answer < /dev/tty
+   answer=$(echo "$answer" | egrep "$filter")
+   if [ "$answer" = "c" ]; then
+    deleting_target=""
+   else
+    if [ -z "$answer" ]; then
+     deleting_target=""
+    else
+     deleting_target=$(echo "$list" | sed -n "${answer}"p 2>/dev/null)
+    fi
+    if [ -z "$deleting_target" ]; then
+     answer=""
+     echo -n "> Please enter a valid target number to delete $option"
+    fi
+   fi
+  done
+  if [ -n "$deleting_target" ]; then
+   target=$(echo "$deleting_target" | cut -d":" -f1 | xargs)
+   option="[(y)es/(n)o]: "
+   filter="^(y|n)$"
+   confirm="> Are you sure to delete the target [${target}]? $option"
+   echo -n "$confirm $option"
+   answer=""
+   while [ -z "$answer" ]; do
+    read answer < /dev/tty
+    answer=$(echo "$answer" | egrep "$filter")
+    if [ -z "$answer" ]; then
+     echo -n "> Please enter a valid option $option"
+    fi
+   done
+   if [ "$answer" = "y" ]; then
+    rm -f "$(echo "$deleting_target" | cut -d":" -f2 | xargs)"
+    echo "> Successfully deleted the target [${target}]"
+   fi
+  fi
+ elif [ "$answer" = "n" ]; then
+  option="[target name/(c)ancel]: "
+  confirm="> Please type the name of target to create"
+  echo -n "$confirm $option"
+  answer=""
+  while [ -z "$answer" ]; do
+   read answer < /dev/tty
+   if [ "$answer" != "c" ] && [ ${#answer} -lt 5 ]; then
+     answer=""
+     echo -n "> Please enter a valid target name to create (min 5 length) $option"
+   fi
+  done
+  if [ "$answer" != "c" ]; then
+   local create_target="${ESYNC_PRESET_PATH}/${answer}.conf"
+   if [ ! -f "$create_target" ]; then
+cat > "$create_target" <<EOF
+#[esync_host]|host_addr|host_rootpath|host_id|host_sshport|host_sudo
+#[synctarget]|pre_action|post_action|history
+#host_path|client_path|exclude|ownwer:ownwer
+EOF
+   fi
+   nano "$create_target"
+   echo "> the target [${answer}] has been created at ${create_target}"
+  fi
+ else
+  answer=$(echo "$answer" | egrep "^([0-9]*)$")
+  local editing_target=$(echo "$list" | sed -n "${answer}"p 2>/dev/null)
+  if [ -z "$editing_target" ]; then
+   option="[number/(c)ancel]: "
+   filter="^([0-9]*|c)$"
+   confirm="> Please type the number of target to edit"
+   echo -n "$confirm $option"
+   answer=""
+   while [ -z "$answer" ]; do
+    read answer < /dev/tty
+    answer=$(echo "$answer" | egrep "$filter")
+    if [ "$answer" = "c" ]; then
+     editing_target=""
+    else
+     if [ -z "$answer" ]; then
+      editing_target=""
+     else
+      editing_target=$(echo "$list" | sed -n "${answer}"p 2>/dev/null)
+     fi
+     if [ -z "$editing_target" ]; then
+      answer=""
+      echo -n "> Please enter a valid target number to edit $option"
+     fi
+    fi
+   done
+  fi
+  if [ -n "$editing_target" ]; then
+   target=$(echo "$editing_target" | cut -d":" -f1 | xargs)
+   option="[(y)es/(n)o]: "
+   confirm="> Would you like to edit the target [${target}]? $option"
+   answer=""
+   echo -n "$confirm $option"
+   read answer < /dev/tty
+   if [ "$answer" = "y" ]; then
+    nano "$(echo "$editing_target" | cut -d":" -f2 | xargs)"
+    echo "> the target [${target}] editing has been done"
+   fi
+  fi
+ fi
+
+ echo ""
+ return 0
+}
+
+ssh_key_copy() {
+ local remote_host="$1"
+ local remote_id="$2"
+ local remote_port="$3"
+
+ if [ -z "$remote_host" ] || [ -z "$remote_id" ] || [ -z "$remote_port" ]; then
+  return 1
+ fi
+
+ if [ ! -d "$ESYNC_KEY_PATH" ]; then
+  mkdir -p "$ESYNC_KEY_PATH"
+ fi
+
+ if [ ! -f "/root/.ssh/id_rsa" ]; then
+  ssh-keygen -t rsa -b 2048
+ fi
+
+ if [ ! -e "${ESYNC_KEY_PATH}/${remote_id}@${remote_host}:${remote_port}" ]; then
+  if bash -c "ssh-copy-id ${remote_id}@${remote_host} -p ${remote_port}"; then
+   touch "${ESYNC_KEY_PATH}/${remote_id}@${remote_host}:${remote_port}"
+  fi
+ fi
+
+ return 0
+}
+
+history_backup() {
+ local action=$(echo "$1" | grep -oE "^(pull|push)$")
+ if [ -z "$action" ]; then
+  return 1
+ fi
+
+ local target="$2"
+ local target_section="$3"
+ local target_path="$4"
+ local history_file="$5"
+ local backup_path=""
+ local remote_host=""
+ local remote_port=""
+
+ if [ -z "$target" ] || [ -z "$target_section" ] || [ -z "$target_path" ] || [ ! -f "$history_file" ]; then
+  return 1
+ fi
+
+ if echo "$target_path" | grep -q ":"; then
+  if [ "$action" = "push" ]; then
+   remote_port=$(validate_port "$6")
+   if [ -z "$remote_port" ] || [ -z "$(echo "$target_path" | grep -o "@")" ]; then
+    return 1
+   fi
+   remote_host=$(echo "$target_path" | awk -F":" '{ print $1; }')
+  else
+   return 1
+  fi
+ fi
+
+ target_section=$(echo "$target_section" | tr -d "[]")
+ if [ "$target" = "$target_section" ]; then
+  target_section=""
+ else
+  target_section="/$target_section"
+ fi
+
+ local datetime=$(date +"%Y%m%d%H%M")
+ local count_info=""
+ if [ -z "$remote_host" ]; then
+  [ ! -d "$HISTORY_PATH" ] && return 1
+
+  local existing_targets=""
+  IFS=$'\n'; for line in $(cat "$history_file"); do
+   if [ -f "$(echo "${target_path}/${line}" | sed "s#//#/#g")" ]; then
+    existing_targets+="$line\n"
+   fi
+  done; unset IFS
+  [ -z "$existing_targets" ] && return 0
+  existing_targets=$(echo -e "$existing_targets" | grep -v "^$")
+
+  backup_path="$HISTORY_PATH/history/${target}${target_section}/${datetime}$target_path"
+  if [ "$(echo "${backup_path: -1}")" != "/" ]; then
+   backup_path="$(echo "$backup_path" | rev | cut -d"/" -f2- | rev)/"
+  fi
+  mkdir -p "$backup_path"
+
+  if echo "$existing_targets" | rsync -a --files-from=- "$target_path" "$backup_path" 2>/dev/null; then
+   count_info=$(echo "$existing_targets" | wc -l)
+   echo -e "[$(date +"%Y-%m-%d %H:%M:%S")] History backup ${count_info} files(s) for \"${target}\" at ${backup_path}\n${existing_targets}" >> "$ESYNC_LOG"
+   echo "  - successfully made history backup for ${count_info} files(s) of \"${target}\" at ${backup_path}"
+  else
+   echo "  - failed to make history backup for \"${target}\" at ${backup_path}"
+  fi
+ else
+  target_path=$(echo "$target_path" | cut -d":" -f2-)
+  if ! echo "$target_path" | grep -q "/$target/"; then
+   return 1
+  fi
+
+  if [ "$(echo "${target_path: -1}")" != "/" ]; then
+   target_path="$(echo "$target_path" | rev | cut -d"/" -f2- | rev)"
+  fi
+
+  local split_path=$(echo "$target_path" | awk -F"/${target}/" '{ print $1"|"$2; }')
+  IFS='|'; split_path=( $split_path ); unset IFS;
+  backup_path="${split_path[0]}/history/${target}${target_section}/${datetime}/"
+  target_path=$(echo "$target_path" | sed -e "s#/${target}/#/${target}/\./#")
+
+  if ! rsync -a -e "ssh -p ${remote_port}" --timeout=10 --rsync-path="rsync" ${history_file} ${remote_host}:/tmp/; then
+   return 0
+  fi
+
+  local host_sudo=""
+  if [ "$7" = "true" ]; then
+   host_sudo="sudo "
+  fi
+
+  local remote_command="'mkdir -p \"${backup_path}\" \
+  && ${host_sudo}rsync -a --relative --files-from=${history_file} \"${target_path}\" \"${backup_path}\" 2>/dev/null \
+  && rm -f ${history_file}'"
+  bash -c "ssh -o ConnectTimeout=3 -p $remote_port $remote_host $remote_command" >/dev/null 2>&1
+  echo "[$(date +"%Y-%m-%d %H:%M:%S")] History backup for \"${target}\" at ${remote_host}:${backup_path}" >> "$ESYNC_LOG"
+  echo "  - completed remote history backup for \"${target}\" at ${remote_host}:${backup_path}"
+ fi
+
+ return 0
+}
+
+esync_all() {
+ local action=$(echo "$1" | grep -oE "^(pull|push)$")
+ local targets=$(echo "$2" | cut -d":" -f1 | awk '{$1=$1};1')
+ if [ -z "$action" ] || [ -z "$targets" ]; then
+  return 1
+ fi
+
+ local answer=""
+ read -t 10 -rp "> Would you like to ${action} all the targets? (y|N) : " answer < /dev/tty
+ answer=$(echo "$answer" | awk '{ print tolower($0); }')
+ [ -z "$answer" ] && echo ""
+ if [ "$answer" = "y" ]; then
+  answer=""
+  read -t 10 -rp "> Really ${action} all the targets? (y|N) : " answer < /dev/tty
+  [ -z "$answer" ] && echo ""
+ fi
+ if [ "$answer" != "y" ]; then
+  echo "> the ${action} for all targets has been cancelled"
+  return 0
+ fi
+
+ IFS=$'\n'; for line in ${targets}; do
+  esync_sync "${action}" "${line}" "force_quiet"
+ done; unset IFS
+
+ return 0
+}
+
+esync_sync() {
+ local action=$(echo "$1" | grep -oE "^(pull|push)$")
+ if [ -z "$action" ]; then
+  echo "[ERROR] No action entered (pull or push)"
+  return 1
+ fi
+
+ local presets=$(find "$ESYNC_PRESET_PATH" -type f -name *.conf)
+ if [ -z "$presets" ]; then
+  echo "[ERROR] No preset defined yet"
+  return 1
+ fi
+
+ local target="$2"
+ local silent_mode=$([ "$3" = "force_quiet" ] && echo "true" || echo "false")
+
+ local answer=""
+ if [ -z "$target" ]; then
+  if [ "$silent_mode" = "false" ]; then
+   echo "[Ellucy esync $action target list]"
+   local list=$(find "$ESYNC_PRESET_PATH" -type f -name "*.conf" -printf '%f: %p\n' 2>/dev/null | sed "s/\.conf\:/ :/")
+   if [ -n "$list" ]; then
+    local detail=""
+    local number=0
+    IFS=$'\n'; for line in ${list}; do
+     (( number++ ))
+     detail=$(get_detail "$line")
+     echo "[$number] $line : $detail"
+    done; unset IFS
+    local option="[number/(a)ll/(c)ancel]: "
+    local filter="^([0-9]*|a)$"
+    if [ "$action" = "restore" ]; then
+     option="[number/(c)ancel]: "
+     filter="^[0-9]*$"
+    fi
+    read -t 10 -rp "> Please type a number of target or command letter ${option}" answer < /dev/tty
+    [ -z "$answer" ] && echo ""
+    answer=$(echo "$answer" | egrep "$filter")
+    if [ -z "$answer" ]; then
+     echo "> ${action} has been cancelled"
+     return 1
+    fi
+    if [ "$answer" = "a" ]; then
+     esync_all "$action" "$list"
+     return 0
+    else
+     target=$(echo "$list" | sed -n "${answer}"p | cut -d":" -f1 | xargs 2>/dev/null)
+    fi
+   else
+    echo "* there is no target"
+   fi
+   if [ -z "$target" ]; then
+    echo "[Error] no $action target entered"
+    return 1
+   fi
+  fi
+ fi
+
+ local preset=$(echo "$presets" | grep "^${ESYNC_PRESET_PATH}/${target}.conf$")
+ if [ -z "$preset" ]; then
+  echo "[ERROR] No target preset file found"
+  return 1
+ fi
+
+ local esync_host=$(grep "^\[esync_host\]" "$preset" | head -1 | cut -d"|" -f2-)
+ IFS='|'; esync_host=( $esync_host ); unset IFS;
+ # esync_host [0:host_addr 1:host_rootpath 2:host_id 3:host_port]
+
+ if [ -z "${esync_host[0]}" ] || [ -z "${esync_host[1]}" ]; then
+  echo "[ERROR] The target preset is wrong (host addr or rootpath missing)"
+  return 1
+ fi
+
+ if [ "$silent_mode" = "false" ]; then
+  read -t 5 -rp "> Would you like to ${action} the target [${target}]? (y|N) : " answer < /dev/tty
+  answer=$(echo "$answer" | awk '{ print tolower($0); }')
+  [ -z "$answer" ] && echo ""
+  if [ "$answer" != "y" ]; then
+   echo "> the target [${target}] ${action}ing has been cancelled"
+   return 0
+  fi
+ fi
+
+ local rsync_opt="--timeout=300 -ar"
+ local remote_host=""
+ local remote_connect=""
+ if [ "${esync_host[0]}" = "localhost" ]; then
+  if [ "${esync_host[1]}" != "localsync" ]; then
+   if [ ! -d "/${esync_host[1]}/${target}" ]; then
+    echo "[ERROR] The local esync host not exists"
+    return 1
+   fi
+  fi
+ else
+  rsync_opt="${rsync_opt}z"
+  if [ -z "${esync_host[2]}" ]; then
+   echo "[ERROR] The esync host login ID is missing"
+   return 1
+  fi
+  if [ -z "${esync_host[3]}" ] || [ -z "$(echo "${esync_host[3]}" | grep -oE "^[0-9]*$")" ]; then
+   if [ -n "${esync_host[3]}" ]; then
+    esync_host[4]="${esync_host[3]}"
+   fi
+   esync_host[3]="22"
+  fi
+  if ! host_check "${target}" "${esync_host[0]}" "${esync_host[1]}" "${esync_host[2]}" "${esync_host[3]}"; then
+   echo "[ERROR] The esync host not working (host down or firewall or wrong configuration)"
+   echo "[INFO] Firewall should open ssh connection between host and client (${esync_host[2]}@${esync_host[0]}:${esync_host[3]})"
+   echo "[INFO] Host esync target path should be owned by ${esync_host[2]}"
+   return 1
+  fi
+  if ! ssh_key_copy "${esync_host[0]}" "${esync_host[2]}" "${esync_host[3]}"; then
+   echo "[ERROR] The esync requires ssh-copy-id for the remote ${action}"
+   return 1
+  fi
+  remote_connect=" -e 'ssh -p ${esync_host[3]}'"
+  remote_host="${esync_host[2]}@${esync_host[0]}:"
+ fi
+
+ local host_sudo=""
+ if [ "${esync_host[4]}" = "true" ]; then
+  if [ -n "$remote_host" ]; then
+   if ! make_sudo_rsync "${esync_host[0]}" "${esync_host[3]}" "${esync_host[2]}"; then
+    echo "[ERROR] The esync host requires sudo rsync"
+    return 1
+   fi
+  fi
+  host_sudo="sudo "
+ fi
+
+ local tasks=$(cat "$preset" 2>/dev/null | grep -v "^\[esync_host\]" | grep -v "^\s*[#;]" | grep -v "^[[:space:]]*$")
+ if [ -z "$tasks" ]; then
+  echo "[ERROR] No task defined"
+  return 1
+ fi
+
+ echo "[START] $action target \"${target}\""
+
+ local direction=""
+ if [ "$action" = "pull" ]; then
+  direction=("from" "to")
+ else
+  direction=("to" "from")
+ fi
+
+ echo "[$(date +"%Y-%m-%d %H:%M:%S")] $action \"${target}\" ${direction[0]} ${esync_host[0]}" >> "$ESYNC_LOG"
+
+ local host_path=""
+ local client_path=""
+ local from=""
+ local to=""
+ local exclude=""
+ local ownership=""
+ local rsync_path=""
+ local host_file=""
+ local client_file=""
+ local pre_action=""
+ local post_action=""
+ local history=""
+ local sync_section=""
+ local sync_targets=""
+ local sync_files=""
+ local count_info=""
+ local rsync_info=""
+ local rsync_brief=""
+ local sync_command=""
+ local job_list=()
+
+ IFS=$'\n'; for line in ${tasks}; do
+  IFS='|'; line=( $line ); unset IFS;
+  host_path="${line[0]}"
+  if [ "${host_path:0:1}" = "[" ]; then
+   pre_action=""
+   history=""
+   if [ -n "$post_action" ]; then
+    job_list+=("${post_action}")
+    post_action=""
+   fi
+   job_list+=("--END--")
+   sync_section="${line[0]}"
+   echo "> checking ${sync_section}"
+   job_list+=("--START--")
+   job_list+=("echo '> ${action}ing ${sync_section}'")
+   pre_action="${line[1]}"
+   if [ -n "$pre_action" ]; then
+    job_list+=("${pre_action}")
+    #job_list+=("${pre_action} 2>/dev/null")
+   fi
+   post_action="${line[2]}"
+   history="${line[3]}"
+  else
+   client_path="${line[1]}"
+   if [ -z "$host_path" ] || [ -z "$client_path" ]; then
+    continue
+   fi
+   if [ "${client_path:0:1}" != "/" ]; then
+    echo "  - error > the client path '${client_path}' should be absolute"
+    continue
+   fi
+   if [ "${esync_host[1]}" = "localsync" ]; then
+    if [ ! -d "${host_path}" ]; then
+     echo "  - error > the host path '${host_path}' for local sync does not exists"
+     continue
+    fi
+   else
+    host_path=$(echo "/${esync_host[1]}/${target}/${host_path}" | sed "s#//#/#g")
+   fi
+
+   exclude=""
+   if [ -n "${line[2]}" ]; then
+    if [ "${line[2]}" != "none" ]; then
+     if echo "${line[2]}" | grep -q ","; then
+      exclude=$(echo "${line[2]}" | awk -F"," '{for(i=1;i<=NF;i++){printf "|%s|,", $i}; printf "\n"}' | tr "|" "'" | sed "s/\,$//")
+      exclude=" --exclude={$exclude}"
+     else
+      exclude=" --exclude '${line[2]}'"
+     fi
+    fi
+   fi
+
+   ownership=""
+   rsync_path=""
+   host_file=""
+   client_file=""
+   if [ "$action" = "pull" ]; then
+    from="${remote_host}${host_path}"
+    to="$client_path"
+    if [ -n "${line[3]}" ]; then
+     if echo "${line[3]}" | grep -q ":"; then
+      ownership=" --chown=${line[3]}"
+     fi
+    fi
+    if [ "$(echo "${client_path: -1}")" != "/" ]; then
+     client_file=$(echo "$client_path" | awk -F"/" '{ printf "/%s", $NF; }')
+     client_path=$(echo "$client_path" | rev | cut -d"/" -f2- | rev)
+    fi
+    if [ ! -d "$client_path" ]; then
+     job_list+=("mkdir -p '$client_path'")
+     if [ -n "$ownership" ]; then
+      job_list+=("chown -R ${line[3]} '$client_path'")
+     fi
+    fi
+   else
+    from="$client_path"
+    to="${remote_host}${host_path}"
+    ownership=" --chown=${esync_host[2]}:${esync_host[2]}"
+    if [ "$(echo "${host_path: -1}")" != "/" ]; then
+     host_file=$(echo "$host_path" | awk -F"/" '{ printf "/%s", $NF; }')
+     host_path=$(echo "$host_path" | rev | cut -d"/" -f2- | rev)
+    fi
+    if [ -n "$remote_host" ]; then
+     rsync_path=" --rsync-path='mkdir -p ${host_path} && ${host_sudo}rsync'"
+    else
+     if [ ! -d "$host_path" ]; then
+      job_list+=("mkdir -p '$host_path'")
+      job_list+=("chown -R ${esync_host[2]}:${esync_host[2]} '$host_path'")
+     fi
+    fi
+   fi
+   if [ -z "$rsync_path" ] && [ -n "$remote_host" ]; then
+    rsync_path=" --rsync-path='${host_sudo}rsync'"
+   fi
+
+   sync_targets=$(bash -c "rsync ${rsync_opt}vh --dry-run --stats --out-format=FILEDETAIL::%n --delete${exclude}${ownership}${remote_connect}${rsync_path} '${from}' '${to}' 2>/dev/null")
+   rsync_info=$(get_rsyncinfo "$(echo "$sync_targets" | tail -16)" "$action")
+   rsync_brief=$(echo "$rsync_info" | grep "^\[rsync_brief\]" | awk '{$1=""}1' | xargs)
+   if [ -z "$rsync_brief" ]; then
+    echo "  - [Warning] ${action} source (${from}) has an error"
+    continue
+   fi
+   rsync_brief=( ${rsync_brief} )
+   # 0: total count, 1: total byte size, 2: transfer count, 3: transfer byte size, 4: transfer human count, 5: transfer human size, 6: approx. time (min)
+
+   if [ "${rsync_brief[0]}" = "0" ] || [ "${rsync_brief[1]}" -lt "100" ]; then
+    echo "  - [Warning] ${action} source (${from}) is empty"
+    continue
+   fi
+
+   if [ "${rsync_brief[2]}" = "0" ] || [ "${rsync_brief[3]}" = "0" ]; then
+    echo "  - nothing to ${action} ${direction[0]} ${from} ${direction[1]} ${to} (same)"
+    continue
+   fi
+
+   if [ "${rsync_brief[2]}" -gt "1000" ]; then
+    echo "  - [Warning] the number of ${action} files is larger than 1,000 (${rsync_brief[4]} files)"
+    if [ "$silent_mode" = "true" ]; then
+     continue
+    else
+     read -t 5 -rp "  - [Warning] massive file transfer is about to happen. Procceed? (y|N) : " answer < /dev/tty
+     answer=$(echo "$answer" | awk '{ print tolower($0); }')
+     [ -z "$answer" ] && echo ""
+     if [ "$answer" != "y" ]; then
+      echo "  - cancelled to ${action} ${direction[0]} ${from} ${direction[1]} ${to} due to massive transfer"
+      continue
+     fi
+    fi
+   fi
+
+   if [ "${rsync_brief[3]}" -gt "10737418240" ]; then
+    echo "  - [Warning] the transfer size of ${action} is bigger than 10GB (${rsync_brief[5]}B)"
+    if [ "$silent_mode" = "true" ]; then
+     continue
+    else
+     read -t 5 -rp "  - [Warning] this will take so long time (arrpox. ${rsync_brief[6]}min) Procceed? (y|N) : " answer < /dev/tty
+     answer=$(echo "$answer" | awk '{ print tolower($0); }')
+     [ -z "$answer" ] && echo ""
+     if [ "$answer" != "y" ]; then
+      echo "  - cancelled to ${action} ${direction[0]} ${from} ${direction[1]} ${to} due to over transfer size"
+      continue
+     fi
+    fi
+   fi
+
+   sync_targets=$(echo "$sync_targets" | grep -v "^$" | grep -E "^(FILEDETAIL\:\:|deleting )")
+   if [ -z "$sync_targets" ]; then
+    echo "  - nothing to ${action} ${direction[0]} ${from} ${direction[1]} ${to} (error)"
+    continue
+   fi
+   sync_targets=$(echo "$sync_targets" | grep -v "\/$")
+
+   echo "  - ${action} detail: ${direction[0]} ${from} ${direction[1]} ${to}"
+   echo "$rsync_info" | grep -v "^\[rsync_brief\]" | awk '{ if ( $1 ~ /^\[/ ) { print "   "$0; } else { print "    - "$0; } }'
+
+   job_list+=("echo '  - ${action} ${direction[0]} ${from} ${direction[1]} ${to} has been started'")
+   job_list+=("echo '  - ${action} info: ${rsync_brief[4]} files, ${rsync_brief[5]}B'")
+   job_list+=("echo '  - ${action} start at '\$(date +\"%Y-%m-%d %H:%M:%S\")")
+
+   if [ "$history" = "true" ]; then
+    sync_files=$(echo "$sync_targets" | sed -r "s/^(FILEDETAIL\:\:|deleting )//g")
+    if [ -n "$sync_files" ]; then
+     job_list+=("echo '  - history backup in process'")
+     history_file=$(mktemp)
+     echo "${sync_files}" > "${history_file}"
+     job_list+=("history_backup '${action}' '${target}' '${sync_section}' '${to}' '${history_file}' '${esync_host[3]}' '${esync_host[4]}'")
+     job_list+=("rm -f '${history_file}'")
+    fi
+   fi
+
+   sync_command="rsync ${rsync_opt} --delete${exclude}${ownership}${remote_connect}${rsync_path} '${from}' '${to}'"
+   sync_command+=" && echo '  - completed to ${action}'"
+   sync_command+=" || echo '  - error occurred while ${action}'"
+   job_list+=("${sync_command}")
+   job_list+=("echo '  - ${action} end at '\$(date +\"%Y-%m-%d %H:%M:%S\")")
+  fi
+ done; unset IFS
+ if [ -n "$post_action" ]; then
+  job_list+=("${post_action}")
+  #job_list+=("${post_action} 2>/dev/null")
+ fi
+ job_list+=("--END--")
+ job_list=$(for i in $(seq 1 $((${#job_list[@]}-1))); do echo "${job_list[$i]}"; done)
+ job_list=$(echo "$job_list" | sed -n '/--START--/{:a;N;/--END--/!ba; /rsync /p}' | grep -vE "^--(START|END)--$")
+ echo "> checking completed"
+
+ if [ -n "$job_list" ]; then
+  echo "[Transfer] transfer target \"${target}\" is in progress..."
+  IFS=$'\n'; for line in ${job_list}; do
+   eval "${line}"
+   #echo "${line}"
+  done; unset IFS
+ fi
+
+ echo "[END] $action target \"${target}\""
+ return 0
+}
+
+status() {
+ local rsync_version=$(rsync --version | grep version | head -1 | awk '{ print $1" "$3; }')
+ local config=$(cat "$ESYNC_CONFIG" 2>/dev/null)
+ local list=$(find "$ESYNC_PRESET_PATH" -type f -name "*.conf" -printf '%f: %p\n' 2>/dev/null | sed "s/\.conf\:/ :/")
+
+printf "[Ellucy esync status report]
+
+1. rsync version:
+%s
+
+2. Config:
+%s
+
+3. Target List:
+%s
+
+4. Log:
+%s
+
+" "${rsync_version}" "${config}" "${list}" "${ESYNC_LOG}"
+
+ return 0
+}
+
+set_config() {
+ local item="$1"
+ local value="$2"
+ if [ -z "$item" ] || [ -z "$value" ]; then
+  echo "[ERROR] required arguments missing"
+  return 1
+ fi
+
+ item=($(echo "$item" | awk '{ print toupper($1); }'))
+ if [ -z "$(echo "$item" | grep -oE "^(ESYNC_HOST_MODE|ESYNC_HOST_SUDO|ESYNC_HOST_PATH|ESYNC_HOST_ID|HISTORY_PATH)$")" ]; then
+  echo "[ERROR] You can set within these configs (esync_host_mode|esync_host_sudo|esync_host_path|esync_host_id|history_path)"
+  return 1
+ fi
+
+ value=$(echo "$value" | awk '{ print tolower($1); }')
+ local valid_limit=""
+ if [ "$item" = "ESYNC_HOST_MODE" ] && [ -z "$(echo "$value" | grep -oE "^(true|false)$")" ]; then
+  valid_limit="true|false"
+ elif [ "$item" = "ESYNC_HOST_SUDO" ] && [ -z "$(echo "$value" | grep -oE "^(true|false)$")" ]; then
+  valid_limit="true|false"
+ elif [ "$item" = "ESYNC_HOST_PATH" ] && [ -z "$(echo "$value" | grep "^/[a-zA-Z]")" ]; then
+  valid_limit="absolute path starting with /[alphabet]"
+ elif [ "$item" = "ESYNC_HOST_ID" ] && [ -z "$(cat /etc/passwd | grep "^$value:")" ]; then
+  valid_limit="existing user id"
+ elif [ "$item" = "HISTORY_PATH" ] && [ ! -d "$value" ]; then
+  valid_limit="existing directory path"
+ fi
+
+ if [ -n "$valid_limit" ]; then
+  echo "[ERROR] You can set ${item} within these values (${valid_limit})"
+  return 1
+ fi
+
+ if cat "$ESYNC_CONFIG" | grep -q "^${item}=${value}$"; then
+  echo "[INFO] configuration is same"
+  return 0
+ fi
+
+ if [ "$item" = "ESYNC_HOST_MODE" ]; then
+  ESYNC_HOST_MODE="$value"
+  if ! host_setup check; then
+   return 1
+  fi
+ fi
+
+ if [ "$item" = "ESYNC_HOST_PATH" ]; then
+  host_setup mkroot "${value}"
+ fi
+
+ sed -i -r "s#^${item}=.*#${item}=${value}#" "$ESYNC_CONFIG"
+ source "$ESYNC_CONFIG"
+
+ echo "[INFO] configuration has been changed"
+ cat "$ESYNC_CONFIG"
+
+ return 0
+}
+
+load_config() {
+ if [ -f "$ESYNC_CONFIG" ]; then
+  source "$ESYNC_CONFIG"
+ fi
+
+ if [ -z "$(echo "$ESYNC_HOST_MODE" | grep -oE "^(true|false)$")" ]; then
+  ESYNC_HOST_MODE="false"
+ fi
+ host_setup check
+
+ if [ -z "$HISTORY_PATH" ] || [ ! -d "$HISTORY_PATH" ]; then
+  HISTORY_PATH="$ESYNC_PATH/history"
+ fi
+ [ ! -d "$HISTORY_PATH" ] && mkdir -p "$HISTORY_PATH"
+
+read -r -d '' esync_conf <<-EOL || true
+ESYNC_HOST_MODE=${ESYNC_HOST_MODE}
+ESYNC_HOST_PATH=${ESYNC_HOST_PATH}
+ESYNC_HOST_ID=${ESYNC_HOST_ID}
+ESYNC_HOST_SUDO=${ESYNC_HOST_SUDO}
+HISTORY_PATH=${HISTORY_PATH}
+EOL
+
+ if [ "$(cat ${ESYNC_CONFIG} 2>/dev/null)" != "${esync_conf}" ]; then
+  echo "${esync_conf}" > "${ESYNC_CONFIG}"
+ fi
+
+ return 0
+}
+
+check_app() {
+ local required_app="sudo rsync ssh nano"
+ local need_install=()
+ for a in ${required_app}; do
+  if ! exists ${a}; then
+   need_install+=("${a}")
+  fi
+ done
+ need_install=$(echo ${need_install[@]} | xargs)
+ if [ -z "$need_install" ]; then
+  return 0
+ fi
+
+ if ! check_internet; then
+  return 1
+ fi
+
+ if [ -f "/etc/apt/sources.list" ]; then
+  apt-get -qq update && apt-get install -y -q ${need_install}
+ elif [ -d "/etc/yum.repos.d" ]; then
+  yum -y -q update && yum -y -q install ${need_install}
+ fi
+
+ return 0
+}
+
+init_check() {
+ if [ -z "$command" ]; then
+  echo "Ellucy ESYNC Version $VERSION"
+  exit 0
+ fi
+
+ if [ $(id -u) -ne 0 ]; then
+  echo "Please run as root"
+  exit 1
+ fi
+
+ if ! check_app; then
+  echo "Could not find or install required app"
+  exit 1
+ fi
+
+ if [ ! -d "${ESYNC_PATH}" ]; then
+  mkdir -p "${ESYNC_PATH}"
+ fi
+
+ if [ ! -d "${ESYNC_PRESET_PATH}" ]; then
+  mkdir -p "${ESYNC_PRESET_PATH}"
+ fi
+
+ load_config
+
+ return 0
+}
+
+help() {
+echo "Ellucy esync $VERSION
+Copyright: Jack Nam(jacknam@ellucy.com)
+
+Commands:
+pull              get file from remote
+push              push file to remote
+set               set config
+status            print enginx status and config
+edit              edit esync target
+host              print esync host status and repo targets
+host set          set esync host target
+
+Usage:
+esync (pull|push) config_preset
+esync (set) item value
+esync status
+esync edit
+esync host
+esync host set target_name
+"
+ return 0
+}
+
+init_check
+case "$command" in
+ pull)
+  esync_sync pull ${@:2}
+  ;;
+ push)
+  esync_sync push ${@:2}
+  ;;
+ host)
+  host_setup ${@:2}
+  ;;
+ edit)
+  edit_target ${@:2}
+  ;;
+ set)
+  set_config ${@:2}
+  ;;
+ status)
+  status
+  ;;
+ help)
+  help
+  ;;
+ *)
+  echo "[ERROR] Command not found. (please refer to help. esync help)"
+esac
+
+exit 0

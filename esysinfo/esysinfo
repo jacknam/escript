@@ -1,0 +1,709 @@
+#!/bin/bash
+#
+# developed by jacknam@ellucy.com
+#
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin:/usr/local/sbin
+command="$1"
+VERSION=0.1
+
+exists() {
+ command -v "$1" >/dev/null 2>&1
+}
+
+external_ip() {
+ dig @1.1.1.1 ch txt whoami.cloudflare +short | sed 's/"//g'
+}
+
+table_report() {
+ local in_d=$([ -z "$2" ] && echo "-s '|'" || ([ "$2" = "space" ] && echo "" || echo "-s '$2'"))
+ local report=$(echo -e "$1" | column -t ${in_d})
+ [ -z "$report" ] && return 1
+
+ local under_bar=$(printf "\x2D%.0s" $(seq 1 $(echo "$report" | wc -L)))
+ local header=$(echo "$report" | head -1)
+ report=$(echo "$report" | sed '1d')
+
+ printf "%s\n%s\n%s\n%s\n%s\n" "$under_bar" "$header" "$under_bar" "$report" "$under_bar"
+ return 0
+}
+
+get_title() {
+ local func=$(echo "${FUNCNAME[1]}" | cut -d"_" -f1)
+ local opt=$(echo "$1" | sed -r 's/(report|json|jsonraw)//g' | xargs)
+ echo "${func^} ${opt^} Info" | xargs
+ return 0
+}
+
+print_output() {
+ local info="$1"
+ local title="$2"
+ local output=$(echo "${@:$#}" | grep -oE -m1 "^(report|json|jsonraw)$")
+
+ if [ "$output" = "report" ]; then
+  echo "> ${title}"
+  table_report "$info"
+ elif [ "${output:0:4}" = "json" ]; then
+  info=$(echo -e "$info")
+  local header=$(echo "$info" | head -1)
+  local json=$(echo "$info" | sed '1 d' | awk -F"|" -v h="$header" -v t="$title" 'BEGIN {split(h,a,"|");}\
+   {o="";for(i=1;i<NF+1;i++){o=o",\""a[i]"\":\""$i"\""};out=out",{"substr(o,2)"}";} END {print "{\""t"\":["substr(out,2)"]}";}')
+  if [ "$output" = "json" ]; then
+   echo "$json" | jq 2>/dev/null
+  else
+   echo "$json"
+  fi
+ else
+  echo -e "$info"
+ fi
+
+ return 0
+}
+
+jq_convert() {
+ local t=
+ if test -t 0; then
+  t="$1"
+ else
+  t="$(cat -)"
+ fi
+ [ -z "$t" ] && return 1
+
+ echo "$t" | sed 's/:$/: -/g;s/^/"/g;s/: /":"/g;s/$/",/g;s/"|"\,/}\,{/g;' | tr '\n' '|' | sed 's/\,|}/|}/g' | tr '|' '\n' | sed -e '1 i {"Datas":[{' -e '$ i }]}' -e '$ d'
+ return 0
+}
+
+jq_filter() {
+ local j=""
+ local i=""
+
+ if test -t 0; then
+  j="$1"
+  i="${@:2}"
+ else
+  j="$(cat -)"
+  i="$@"
+ fi
+
+ if [ -z "$j" ] || [ -z "$i" ]; then
+  return 1
+ fi
+ i=$(echo "$i"  | sed 's/|/","/g' | awk '{ print "{\""$0"\"}"; }')
+
+ echo "$j" | jq -c "$i" 2>/dev/null
+ return 0
+}
+
+jq_data() {
+ local t=
+ if test -t 0; then
+  t="$1"
+ else
+  t="$(cat -)"
+ fi
+ [ -z "$t" ] && return 1
+
+ echo "$t" | sed -r 's/":([0-9]+)/":"\1"/g;s/^\{//;s/\}$//;s/:null/:"-"/g;s/"[^"]*"://g;s/","/|/g;s/"//g;s/ \|/|/g;s/\| /|/g;' | awk '{$1=$1}1'
+ return 0
+}
+
+seq_item() {
+ echo "$1" | awk 'BEGIN {FS="|";OFS="|";} {for(i=1;i<NF+1;i++){if(match($i,/\[[[:alnum:]]+-[[:alnum:]]\]/)) {\
+  a=index($i,"[");b=index($i,"]");c=substr($i,a+1,b-a-1);d=c;sub("-","..",d);\
+  cmd="bash -c \"echo {"d"}\"";cmd | getline r;close(cmd);split(r,e," ");\
+  f="";for(j=1;j<length(e)+1;j++) {t=$i;sub(c,e[j],t);gsub(/[\[\]]/,"",t);f=f"|"t;}\
+  f=substr(f,2);$i=f;}} print $0;}'
+}
+
+system_uuid() {
+ dmidecode -s system-uuid
+}
+
+os_info() {
+ local info=""
+ if [ "$1" = "usage" ]; then
+  local cpu=$(cat /proc/stat | awk '/cpu/{if($1=="cpu"){s=0;for(i=2;i<10;i++){s+=$i};a=sprintf("%.2f%",(s-$5-$6)*100/s);} else {b+=1;}} END { print b"|"a; }')
+  local cpu_avg=$(uptime | rev | cut -d"," -f1 | rev | xargs)"%"
+  local temp=$(cat /sys/class/hwmon/hwmon*/temp*_input 2>/dev/null)
+  [ -z "$temp" ] && temp=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null)
+  temp=$(echo "$temp" | awk '{a+=1;b+=$1;} END { printf("%.1fC\n", b/a/1000); }')
+  local mem=$(free -b | grep -E "^(Mem|Swap):" | awk 'function aaf(n) {r="";cmd="numfmt --to=iec --format \"%.1f\" "n;cmd | getline r;close(cmd);sub("\\.0","",r);return r"B";}\
+   {d=aaf($2);e=sprintf("%.2f%",$3/$2*100);f=f"|"d"|"e;} END {g=substr(f,2); print g;}')
+  local disk=$(lsblk -s -o PATH,FSUSE%,FSAVAIL | sed '1 d' | sed 's/%//g' | awk 'NF>2 {if($2>a){a=$2;b=$1"|"$2"%|"$3"B";}} END {print b;}')
+  local user=$(w | tail -n +3 | awk 'a=0;{c+=1;sub(/:.*/,"L",$2);sub(/^[a-z].*/,"R",$2);if($2=="L")a+=1;else b+=1;} END {print c"(L"a"/R"b")";}')
+  local up=$(uptime -s)
+  local boot=$(dmidecode -t 32 | grep "Status:" | cut -d":" -f2 | xargs)
+  if [ -z "$boot" ] || [ "$boot" = "No errors detected" ]; then
+   boot="OK"
+  else
+   boot="Error"
+  fi
+
+  info="$cpu|$cpu_avg|$temp|$mem|$disk|$user|$up|$boot"
+  local status=$(echo "$info" | awk -F"|" '{gsub(/[%C]/,"");a="OK";if($3>90||$4>60||$6>90||$10>80||$14=="Error")a="WARN";} END { print a; }')
+  info="CPU Core|CPU Usage|CPU Avg|Temp.|Mem Total|Mem Usage|Swap|Swap Usage|Disk Fullest|DF Usage|DF Left|User|Uptime|Boot|Status\n$info|$status"
+ else
+  local mtype=$(lscpu | grep -q 'Hypervisor' && echo 'VM' || echo 'Physical')
+  local os=$(cat /etc/*-release | uniq | grep "PRETTY_NAME" | cut -d"=" -f2 | sed 's/"//g')
+  info="$mtype|$os|"$(arch)"|"$(uname -r)"|"$(hostname)
+
+  local eip=$(dig @1.1.1.1 ch txt whoami.cloudflare +short | sed 's/"//g')
+  [ -z "$eip" ] && eip="-"
+  local gw=$(ip route | grep "^default" | cut -d" " -f3)
+  local ips=$(ip route | grep -vE "(^default|linkdown)" | sed -r 's/.*src ([1-9]{1,3}.[^ ]*).*/\1/' | sort)
+  local mip=$(echo "$ips" | grep -m1 "^$(echo "$gw" | cut -d"." -f1-3).")
+  [ -z "$mip" ] && mip=$(echo "$ips" | head -1)
+  local ipc=$(echo "$ips" | sed '1 d' | wc -l)
+  [ "$ipc" -gt "0" ] && mip+=" &$ipc+"
+  info+="|$eip|$gw|$mip"
+  info="Machine|OS|Arch|Kernel|Hostname|External IP|Gateway|Internal IP\n$info"
+ fi
+
+ local title=$(get_title "$1")
+ print_output "$info" "$title" "${@:$#}"
+ return 0
+}
+
+system_info() {
+ local items=
+ local data=
+ local dmi=$(dmidecode -t bios -t system -t baseboard -t chassis | sed 's/^$/|/g' | awk '{$1=$1}1')
+
+ items="Vendor|Release Date|Version|BIOS Revision"
+ data=$(echo "$dmi" | sed -n '/ DMI type 0,/{:a;N;/|/!ba;p}' | grep -E "^(${items}|\|)")
+
+ local bios=$(echo "$data" | jq_convert | jq '."Datas"[]' | jq_filter ${items} | jq_data\
+  | awk 'function aaf(s) {r="";cmd="date -d\""s"\" +%Y-%m-%d"; cmd | getline r; close(cmd); if(r=="") r="-"; return r;}\
+  BEGIN {FS="|";OFS="|";} {$2=aaf($2); print $0;}')
+
+ items="Manufacturer|Product Name"
+ data=$(echo "$dmi" | sed -n '/ DMI type 1,/{:a;N;/|/!ba;p}' | grep -E "^(${items}|\|)")
+ local system=$(echo "$data" | jq_convert | jq '."Datas"[]' | jq_filter ${items} | jq_data)
+
+ items="Manufacturer|Product Name|Version|Serial Number"
+ data=$(echo "$dmi" | sed -n '/ DMI type 2,/{:a;N;/|/!ba;p}' | grep -E "^(${items}|\|)")
+ local baseboard=$(echo "$data" | jq_convert | jq '."Datas"[]' | jq_filter ${items} | jq_data)
+
+ items="Manufacturer"
+ data=$(echo "$dmi" | sed -n '/ DMI type 3,/{:a;N;/|/!ba;p}' | grep -E "^(${items}|\|)")
+ local chassis=$(echo "$data" | jq_convert | jq '."Datas"[]' | jq_filter ${items} | jq_data)
+
+ items="Status"
+ data=$(echo "$dmi" | sed -n '/ DMI type 32,/{:a;N;/|/!ba;p}' | grep -E "^(${items}|\|)")
+ local boot=$(echo "$data" | jq_convert | jq '."Datas"[]' | jq_filter ${items} | jq_data)
+
+ local info=$(echo "$bios|$baseboard|$system|$chassis|$boot" | sed 's/To Be Filled By O.E.M./-/g;s/1234567890/-/g;s/No errors detected/NONE/g;')
+ info="BIOS Vendor|BIOS Ver.|BIOS Date|BIOS Rev.|MB Vendor|MB|MB Ver.|MB Serial|System Vendor|System|Chassis|Boot Error\n${info}"
+
+ local title=$(get_title "$1")
+ print_output "$info" "$title" "${@:$#}"
+ return 0
+}
+
+cpu_info() {
+ local items=
+ local data=
+ local dmi=$(dmidecode -t processor -t cache | sed 's/^$/|/g' | awk '{$1=$1}1')
+
+ items=$(seq_item "Socket Designation|Version|Voltage|External Clock|Max Speed|Current Speed|L[1-3] Cache Handle|Core Count|Thread Count")
+ data=$(echo "$dmi" | sed -n '/ DMI type 4,/{:a;N;/|/!ba;p}' | grep -E "^(${items}|\|)")
+ data=$(echo "$data" | jq_convert | jq '."Datas"[]' | jq_filter ${items} | jq_data)
+
+ local cache=$(echo "$dmi" | sed -n '/ DMI type 7,/{:a;N;/|/!ba;p}' | grep -E "^(Handle|Socket Designation|Installed Size|\|)"\
+  | cut -d',' -f1 | cut -d: -f2 | cut -d',' -f1 | cut -d: -f2 | sed 's/Handle //g;s/ kB//g;' | awk '{$1=$1}1'\
+  | tr '\n' '@' | tr '|' '\n' | tr '@' '|' | sed 's/^|//g;s/|$//g;'\
+  | awk 'function aaf(n) {r="";cmd="numfmt --to=iec --format \"%.1f\" "n*1024;cmd | getline r;close(cmd);sub("\\.0","",r);return r"B";}\
+  BEGIN {FS="|";OFS="|"} {$NF=aaf($NF); print $0;}')
+
+ local info=$(echo "$data" | awk -v ref="$cache" '\
+ function aaf(s) {r="";cmd="echo \""ref"\" | grep \"^"s"|\" | cut -d\"|\" -f3"; cmd | getline r; close(cmd); if(r=="") r="-"; return r;}\
+ function bbf(s) {r="";split(s,a," ");if(length(a)<2) return s;if(a[2]=="MHz" && length(a[1])>3){a[1]=sprintf("%.1f",a[1]/1000);a[2]="GHz";}r=a[1]" "a[2];return r;}\
+ BEGIN {FS="|";OFS="|"} {for(i=5;i<10;i++) { if(i>6) {$i=aaf($i)} else {$i=bbf($i);} } print NR,$0;}')
+
+ info="ID|Socket|Model|Voltage|Clock|Max|Current|L1|L2|L3|Core|Thread\n${info}"
+
+ local title=$(get_title "$1")
+ print_output "$info" "$title" "${@:$#}"
+ return 0
+}
+
+memory_info() {
+ local items=
+ local data=
+ local dmi=$(dmidecode -t memory | sed 's/^$/|/g' | awk '{$1=$1}1')
+
+ items="Array Handle|Bank Locator|Locator|Form Factor|Type|Size|Speed|Configured Memory Speed|Manufacturer|Part Number|Type Detail"
+ data=$(echo "$dmi" | sed -n '/ DMI type 17,/{:a;N;/|/!ba;p}' | grep -E "^(${items}|\|)" | sed 's/: unknown/: -/gi;s/: no[^n].*/: -/gi;')
+ if ! echo "$data" | grep -q "Configured Memory Speed"; then
+  data=$(echo "$data" | sed -r 's/Speed: (.*)/Speed: \1\nConfigured Memory Speed: \1/')
+ fi
+ data=$(echo "$data" | jq_convert | jq '."Datas"[]' | jq_filter ${items} | jq_data)
+
+ local handle=$(echo "$dmi" | sed -n '/ DMI type 16,/{:a;N;/|/!ba;p}' | grep -E "^(Handle|Use|Error Correction Type|Maximum Capacity|Number Of Devices|\|)"\
+  | cut -d',' -f1 | cut -d: -f2 | cut -d',' -f1 | cut -d: -f2 | sed 's/Handle //g;s/ Memory//g;' | awk '{$1=$1}1'\
+  | tr '\n' '@' | tr '|' '\n' | tr '@' '|' | sed 's/^|//g;s/|$//g;'\
+  | awk 'BEGIN {FS="|";OFS="|"} {print NR,$0;}')
+
+ local module=$(echo "$handle" | grep "|System|" | awk 'BEGIN {FS="|";OFS="|";} {sum+=$NF; cnt+=1;} END { print cnt,$NF,sum,$4,$5; }')
+ local ecc=$(echo "$module" | grep -q " ECC" && echo "Y" || echo "N")
+
+ local info=$(echo "$data" | awk -v handle="$handle" -v ecc="$ecc" '\
+ function aaf(s) {r="";cmd="echo \""handle"\" | grep \"|"s"|\" | cut -d\"|\" -f1,3";cmd | getline r;close(cmd); if(index(r,"|")) {split(r,a,"|");r=a[2]"|ARR"a[1];} else {r="-|-"}; return r;}\
+ function bbf(s) {if(toupper(substr(s,0,4))!="BANK") s="BANK"(NR-1);return s;}\
+ function ccf(s) {r="";if(s=="-" || index(s,"Volatile")!=0)return "-|-|-|-"; r=ecc; split("Synchronous|Registered|Buffered",arr,"|");\
+ for(idx=1;idx<length(arr)+1;idx++) {if(index(s,arr[idx])!=0) r=r"|Y"; else r=r"|N";} return r;}\
+ BEGIN {FS="|";OFS="|";} {$1=aaf($1);$2=bbf($2);$NF=ccf($NF); print NR,$0;}')
+
+ if [ "$1" = "module" ]; then
+  local total=$(echo "$info" | grep "|System|" | awk -F'|' '{ if($8!="-") {split($8,a," ");if(a[2]=="MB"){a[1]=a[1]/1024;}t+=a[1];}} END {print t;}')
+  info="Module|Slots per Module|Total Slots|Error Correction|Maximum Size|Current Size\n${module}|${total} GB"
+ else
+  info="No|Target|Module|Bank|Slot|Form|Type|Size|Max Speed|Cur Speed|Manufacturer|ProductID|ECC|Sync.|Reg.|Buff.\n${info}"
+ fi
+
+ local title=$(get_title "$1")
+ print_output "$info" "$title" "${@:$#}"
+ return 0
+}
+
+pci_info() {
+ local items=
+ local data=
+ local dmi=$(dmidecode -t slot | sed 's/^$/|/g' | awk '{$1=$1}1')
+
+ items="ID|Designation|Type|Length|Current Usage|Bus Address"
+ data=$(echo "$dmi" | sed -n '/ DMI type 9,/{:a;N;/|/!ba;p}' | grep -E "^(${items}|\|)")
+ data=$(echo "$data" | jq_convert | jq '."Datas"[]' | jq_filter ${items} | jq_data)
+ data=$(echo "$data" | sed 's/ PCI Express/ PCIE/g;s/ SLOT /_SLOT/g;')
+
+ local pci=$(lspci | awk 'BEGIN {FS=": ";OFS="|"} { a=substr($1,0,7);b=substr($1,9); print a,b,$2; }')
+ local info=$(echo "$data" | awk -v pci="$pci" '\
+ function aaf(s) {r="";a=index(s,":");b="-";if(a!=0){b=substr(s,a+1);cmd="echo \""pci"\" | grep \"^"b"|\"";cmd | getline r;close(cmd);} if(r==""){r=b"|-|-"} return r;}\
+ function bbf(s) {r="F";if(s=="In Use") r="U"; if(s=="Available") r="A"; return r;}\
+ function ccf(s) {if(index(s,":")==0)return "-";split(s,v,":");split(v[3],w,".");x=strtonum("0x" v[2]);y=strtonum("0x" w[1]);z=strtonum("0x" w[2]);return "PCI:"x":"y"."z;}\
+ function ddf(s) {sub(/ PCI.*[0-9]+/,"",s); gsub(" ","",s); return s;}\
+ function eef(s) {sub(/ x[0-9]+$/,"",s);return s;}\
+ BEGIN {FS="|";OFS="|"} {$2=ddf($2);$3=eef($3);$NF=ccf($NF)"|"aaf($NF);$(NF-1)=bbf($(NF-1));print $0;}')
+
+ info="ID|Slot|Type|Length|Status|PCI Addr|Bus Addr|Kind|Device\n${info}"
+
+ local title=$(get_title "$1")
+ print_output "$info" "$title" "${@:$#}"
+ return 0
+}
+
+sata_info() {
+ local info=
+ local map=$(join -t"|" -e"-" -a1 -1 1 -2 1 -o 1.2,1.3,2.2,2.3,2.4\
+  <(ls -l /sys/block/sd* | grep "/ata" | rev | cut -d"/" -f3,6,7 | rev | awk 'BEGIN{FS="/";OFS="|";}{$1=substr($1,6); print $3,$2,$1;}' | sort -n)\
+  <(lsblk -S -o HCTL,PATH,SIZE,MODEL,TRAN | grep "sata$" | sed -r 's/ +/|/g' | sort -n) 2>/dev/null)
+
+ local sata=$(journalctl -b | grep "SATA" | grep -E "kernel: (ahci|ata)"\
+  | sed -r 's/.*ahci ([^ ]*).*([0-9.]+[^b]*)bps.*/ahci|\1|\2/;s/.*(ata[0-9][^:]*):.*(link[^(]*|irq).*/\1|\2/')
+
+ if [ -z "$sata" ]; then
+  sata=$(join -t"|" -e"-" -a1 -1 2 -2 1 -o 1.1,2.2,1.3,1.4,1.5 <(echo "$map") <(lspci | grep "SATA controller:"\
+   | awk '{ print $1"|"$4 }') 2>/dev/null)
+  info=$(echo "$sata" | awk 'function aaf(n) {r="";cmd="smartctl -i "n" | grep \"^SATA Version\" | cut -d\" \" -f7,10";cmd | getline r;close(cmd);return r;}\
+   BEGIN{FS="|";OFS="|";} {split(aaf($3),a," "); $1=$1"|"a[1]" Gbps"; $3="up|"a[2]" Gbps|"$3; print $0;}')
+ else
+  local ref=$(echo "$sata" | grep -v "link"\
+   | awk 'BEGIN{FS="|";OFS="|";} {if($1=="ahci"){split($2,b,":");c=b[2]":"b[3];a=$3"bps|"c;}else {print $1"|"a;}}')
+  ref=$(join -t"|" -e"-" -a1 -1 3 -2 1 -o 1.1,1.2,2.2 <(echo "$ref") <(lspci | grep "SATA controller:"\
+   | awk '{ print $1"|"$4 }') 2>/dev/null)
+  sata=$(echo "$sata" | grep "link" | sed 's/link //;s/^ata//;s/|down.*/|down|-/;s/ /|/;s/ $//g;'\
+   | awk 'BEGIN{FS="|";OFS="|";} {if(index($1,".")==0)$1=$1".00";split($1,a,"."); print a[1]"."a[2],$2,$3,"ata"a[1]; }' | sort -u -n)
+  sata=$(join -t"|" -e"-" -a1 -1 4 -2 1 -o 1.1,2.2,2.3,1.2,1.3 <(echo "$sata") <(echo "$ref") 2>/dev/null | sed 's/\.00|/|/;s/^/ata/;')
+  info=$(join -t"|" -e"-" -a1 -1 1 -2 1 -o 1.1,1.2,1.3,1.4,1.5,2.3,2.4,2.5 <(echo "$sata") <(echo "$map") 2>/dev/null)
+ fi
+ info=$(echo "$info" | awk '{print NR"|"$0;}')
+ info="NO|Port|Max Link|Chipset|Status|Current Link|Dev|Size|Model\n${info}"
+
+ local title=$(get_title "$1")
+ print_output "$info" "$title" "${@:$#}"
+ return 0
+}
+
+disk_info() {
+ local items=
+ local jitems=
+ local json_data=
+ local info=
+
+ if [ "$1" = "part" ]; then
+  items="NAME,PATH,SIZE,TYPE,MODEL,FSTYPE,MOUNTPOINT,FSSIZE,FSAVAIL,FSUSED,FSUSE%"
+  jitems=$(echo "${items,,}" | sed 's/\,/|/g')
+  json_data=$(lsblk --json -o ${items} | jq -c '."blockdevices"[]'\
+   | jq_filter "${jitems}|children" | jq_data | sed 's/\,\[{/\n./g;s/}\]//g;')
+
+  #info=$(paste -d"|" <(lsblk -o NAME | sed '1 d' | sed 's/ /-/g;s/[^[:alnum:]]/-/g;s/--/./g;') <(echo "$json_data" | sed 's/}\,{/\n./g;' | cut -d"|" -f2-))
+  info=$(echo "$json_data" | awk 'BEGIN {FS="|";OFS="|";b="";} {a=substr($1,1,1); if(a!=".")b="";print b""$0; if(a==".") b=b"."; else b="";}' | sed 's/}\,{/\n./g;')
+
+  info="Struct|Dev|Disk Size|Type|Model|FSType|Mounted|Size|Avail|Used|Use%\n${info}"
+ else
+  items="PATH,TYPE,SIZE,MODEL,FSTYPE,MIN-IO,OPT-IO,LOG-SEC,PHY-SEC,RQ-SIZE,WWN"
+  jitems=$(echo "${items,,}" | sed 's/\,/|/g')
+  json_data=$(lsblk --json -b -o ${items} | jq '."blockdevices"[]' | jq_filter ${jitems} | jq_data)
+  info=$(echo "$json_data" | grep -v "|part|" | sort -u\
+  | awk 'function aaf(n,t) {r="";if(t!="si")t="iec";cmd="numfmt --round=nearest --to="t" "n;cmd | getline r;close(cmd);sub("\\.0","",r);return r;}\
+  BEGIN {FS="|";OFS="|";} {if($4=="-")$4="Virtual";else if($5=="-")$5="local_mount";if($7=="0")$7=$6; $3=aaf($3,"si")"B|"aaf($3)"iB";$6=aaf($6); $7=aaf($7); print NR,$0; }')
+
+  info="NO|Dev|Type|Size|IEC Size|Model|FSType|MIN IO|OPT IO|LOG SEC|PHY SEC|RQ Size|WWN\n${info}"
+ fi
+
+ local title=$(get_title "$1")
+ print_output "$info" "$title" "${@:$#}"
+ return 0
+}
+
+network_info() {
+ local route=$(ip route)
+ local ips=$(join -t"|" -e "-" -a1 -o 1.1,1.2,1.3,2.2\
+  <(echo "$route" | grep "dev.*proto.*scope link src"\
+   | sed -r 's/.*dev ([^ ]*) proto ([^ ]*) scope link src ([^ ]*).*/\1|\3|\2/;s/kernel/static/g;' | sort | sort -u -t"|" -k1,2)\
+  <(echo "$route" | grep "default via.*dev.*" | sed -r 's/default via ([^ ]*) dev ([^ ]*).*/\2|\1/'))
+
+ local items=
+ local json=
+ local ifaces=
+
+ if [ "$1" = "stat" ]; then
+  items="ifname|link_type|operstate"
+  json=$(ip -j -s -c link show | jq '.[]')
+  ifaces=$(echo "$json" | jq_filter ${items} | jq_data)
+
+  items="bytes|packets|errors|dropped"
+  ifaces=$(paste -d"|" <(echo "$ifaces")\
+   <(echo "$json" | jq '."stats64"."rx"' | jq_filter ${items} | jq_data)\
+   <(echo "$json" | jq '."stats64"."tx"' | jq_filter ${items} | jq_data))
+
+  info=$(join -t"|" -e "-" -a1 -o 1.1,1.2,1.3,2.2,2.4,1.4,1.5,1.6,1.7,1.8,1.9,1.10,1.11\
+   <(echo "$ifaces" | grep -v "^lo|") <(echo "$ips") | awk '\
+   function aaf(n) {r="";cmd="numfmt --to=iec --format \"%.1f\" "n;cmd | getline r;close(cmd);sub("\\.0","",r);return r"B";}\
+   BEGIN {FS="|";OFS="|"} {$6=aaf($6);$10=aaf($10);print $0;}')
+
+  info="Interface|Type|Status|IP|Gateway|Rx|Rx Packet|Rx Err|Rx Drop|Tx|Tx Packet|Tx Err|Tx Drop\n${info}"
+ else
+  items="ifname|link_type|operstate|mtu|address"
+  json=$(ip -j -c link show | jq '.[]')
+  ifaces=$(echo "$json" | jq_filter ${items} | grep -v '"lo"' | jq_data)
+  info=$(join -t"|" -e "-" -a1 -o 1.1,1.2,1.3,1.4,1.5,2.2,2.3,2.4 <(echo "$ifaces") <(echo "$ips"))
+  info="Interface|Type|Status|MTU|MAC|IP|IP Assign|Gateway\n${info}"
+ fi
+
+ local title=$(get_title "$1")
+ print_output "$info" "$title" "${@:$#}"
+ return 0
+}
+
+usb_info() {
+ local info=""
+ local raw=
+ if [ "$1" = "full" ]; then
+  raw=$(lsusb -v 2>/dev/null | sed 's/^$/|/g' | awk '{$1=$1}1'\
+   | grep -E "(^Bus|bcdUSB|idVendor|idProduct|iManufacturer|iProduct|bInterfaceClass|bInterfaceProtocol|\|)")
+  local data=""
+  local r=""
+  local type=""
+  oIFS="$IFS"; IFS="|"; local datas=(${raw}); IFS="$oIFS"
+  for (( i=0; i<${#datas[@]}; i++ )); do
+   data="${datas[i]}"
+   [ -z "$data" ] && continue
+   arr=($(echo "$data" | grep "^Bus" | sed 's/:/ /g;s/Bus//;s/Device//;s/ID//;' | xargs))
+   r=$(echo "${arr[@]:0:4}" | tr ' ' '|')
+   type=$([ "${arr[1]}" = "001" ] && echo "Port" || echo "Device")
+   r+="|$type|"$(echo "$data" | grep -m1 "^bcdUSB" | awk '{$NF=sprintf("%.1f",$NF);print $NF;}')
+   r+="|"$(echo "$data" | grep -E "^(idVendor|idProduct|iManufacturer|iProduct)" | cut -d" " -f3- | tr '\n' '|')
+   r+=$(echo "$data" | grep "^bInterfaceClass" | cut -d" " -f3- | sort -u | tr '\n' '|' | sed 's/|$//;s/|/ \/ /g;')
+   r+="|"$(echo "$data" | grep "^bInterfaceProtocol" | cut -d" " -f3- | sort -u | tr '\n' '|' | sed 's/|$//;s/|/ \/ /g;')
+   info+="\n$r"
+  done
+  info=$(echo -e "$info" | grep -v "^$" | sort -k1,1 -k2,2 -t'|' | sed "s/ $(uname -r)//g"\
+   | awk 'BEGIN {FS="|";OFS="|"} {if($8=="") $8=$10; for(i=1;i<NF+1;i++) {if($i=="") $i="-";}; print $0;}')
+  info="BID|DID|VID|PID|Type|USB|Vendor|Product|Manufacturer|Product|Interface|Note\n${info}"
+ else
+  raw=$(lsusb | sort)
+  local devs=$(echo "$raw" | grep -v " Device 001:")
+  local dev=
+  local arr=
+  local ver=
+  local status=
+  while read -r line; do
+   ver=$(echo "$line" | cut -d" " -f7- | sed 's/[^0-9.]//g;')
+   arr=($line)
+   dev=$(echo "$devs" | grep -m1 "Bus ${arr[1]} ")
+   if [ -z "$dev" ]; then
+    status="A"
+    dev="-"
+   else
+    status="U"
+    arr=($dev)
+    dev="${arr[@]:6}"
+   fi
+   info+="\nUSB${ver}|${status}|${arr[1]}|${arr[3]:0:-1}|${arr[5]/:/|}|${dev}"
+  done <<< "$(echo "$raw" | grep " Device 001:")"
+  info=$(echo -e "$info" | grep -v "^$" | awk 'BEGIN {FS="|";OFS="|"} { print NR,$0; }')
+
+  info="NO|Version|Status|Bus ID|Device ID|Venddor ID|Product ID|Device\n${info}"
+ fi
+
+ local title=$(get_title "$1")
+ print_output "$info" "$title" "${@:$#}"
+ return 0
+}
+
+device_info() {
+ local pci=$(pci_info | sed '1 d' | grep -v '|-$' | awk 'BEGIN {FS="|";OFS="|"} {print $2,$7,$8,$9; }')
+ local onboard=$(lspci | grep "controller:" | grep -v "USB controller:" | awk 'BEGIN {FS=": ";OFS="|"} { a=substr($1,0,7);b=substr($1,9); print a,b,$2; }'\
+  | awk -v pci="$pci" '\
+ function aaf(s) {r="";cmd="echo \""pci"\" | grep \"|"s"|\"";cmd | getline r;close(cmd); return r;}\
+ BEGIN {FS="|";OFS="|"} {if(aaf($1)=="") {print "ONBOARD",$0;}}')
+
+ local usb=$(usb_info full | grep "|Device|" | awk 'BEGIN {FS="|";OFS="|"} {print "USB"$6,$1":"$2,$11,$7" "$8" ("$10")"; }')
+ local info="Port|Address|Kind|Device\n${pci}\n${onboard}\n${usb}"
+
+ local title=$(get_title "$1")
+ print_output "$info" "$title" "${@:$#}"
+ return 0
+}
+
+port_info() {
+ local dmi=$(dmidecode | sed 's/^$/|/g' | awk '{$1=$1}1')
+
+ local cpu=$(echo "$dmi" | sed -n '/ DMI type 4,/{:a;N;/|/!ba;p}' | grep -E "^(Socket Designation|Family|Manufacturer|\|)"\
+  | cut -d',' -f1 | cut -d: -f2 | cut -d',' -f1 | cut -d: -f2 | awk '{$1=$1}1'\
+  | tr '\n' '@' | tr '|' '\n' | tr '@' '|' | sed 's/^|//g;s/|$//g;' | awk -F"|" '{a+=1;if(b=="") b=$3" "$2;} END { print a"|"b; }')
+
+ local memory=$(echo "$dmi" | sed -n '/ DMI type 16,/{:a;N;/|/!ba;p}' | grep -E "^(Use|Error Correction Type|Maximum Capacity|Number Of Devices|\|)"\
+  | cut -d',' -f1 | cut -d: -f2 | cut -d',' -f1 | cut -d: -f2 | awk '{$1=$1}1'\
+  | tr '\n' '@' | tr '|' '\n' | tr '@' '|' | sed 's/^|//g;s/|$//g;' | grep "^System Memory"\
+  | awk 'BEGIN {FS="|";OFS="|"} {a+=1;b+=$NF;} END {c="None ECC";if(index($2," ECC")) c="ECC"; print b,a,c,$3}')
+
+ local pci=$(echo "$dmi" | sed -n '/ DMI type 9,/{:a;N;/|/!ba;p}' | grep -E "^(Designation|Type|\|)"\
+  | cut -d',' -f1 | cut -d: -f2 | cut -d',' -f1 | cut -d: -f2 | awk '{$1=$1}1'\
+  | tr '\n' '@' | tr '|' '\n' | tr '@' '|' | sed 's/^|//g;s/|$//g;')
+
+ local pcie=$(echo "$pci"| grep -v "M.2" | grep -E "x[0-9]+" | sed -r 's/.*(x[0-9]+).*/\1/' | sort | uniq -c\
+  | awk '{b=b", "$2" x "$1;} END { sub(", ","",b); print b; }')
+
+ pci=$(echo "$pci" | awk -v pcie="$pcie" 'BEGIN {m=0;p=0;pe=0;v=2;if(pcie=="")pcie="-";FS="|";OFS="|"}\
+  {if(index($1,"M.2")) m+=1; else { x=index($2,"PCI Express");if(x) {pe+=1;y=substr($2,x+12);z=index(y," ");\
+  y=substr(y,0,z-1); if(y>v) v=y;} else p+=1;}} END {if(pe==0) {v="-"} print p,m,pe,v,pcie;}')
+
+ local sata=$(sata_info | sed '1 d' | cut -d"|" -f3 | uniq -c\
+  | awk '{if(c<$2) c=$2; a+=$1;b=b", "$2" Gbps x "$1;} END { sub(", ","",b); print a"|"c" Gpbs|"b; }')
+ [ -z "$sata" ] && sata="-|-|-"
+
+ local usb=$(lsusb | grep " Device 001:" | cut -d" " -f7- | sed 's/[^0-9.]//g' | sort | uniq -c\
+  | awk '{if(c<$2) c=$2; a+=$1;b=b", "$2" x "$1;} END { sub(", ","",b); print a"|"c"|"b; }')
+
+ local ipmi=$(echo "$dmi" | sed -n '/ DMI type 38,/{:a;N;/|/!ba;p}' | grep "Specification Version:" | cut -d":" -f2 | xargs)
+ [ -z "$ipmi" ] && ipmi="-"
+
+ local ports=$(echo "$dmi" | sed -n '/ DMI type 8,/{:a;N;/|/!ba;p}' | grep "External Reference Designator" | grep -v "Not Specified" | cut -d":" -f2-\
+  | awk '{$1=$1}1' | tr '\n' ',' | sed 's/,$/\n/;s/USB[^,]*,//g;s/USB.*//g;')
+ [ -z "$ports" ] && ports="-"
+
+ local info="CPU|CPU Type|Mem|Mem Array|Mem Type|Mem Max|PCI|M.2|PCIE|PCIE Gen|PCIE Slot|SATA|SATA Max|SATA Port|USB|USB Gen|USB Port|IPMI|Onboard Ports\n$cpu|$memory|$pci|$sata|$usb|$ipmi|$ports"
+ if [ "$1" = "detail" ]; then
+  info=$(echo -e "$info" | awk 'BEGIN {FS="|";OFS="|"} { print $2,$4,$5,$11,$14,$17,$19;}')
+ else
+  info=$(echo -e "$info" | awk 'BEGIN {FS="|";OFS="|"} { print $1,$3,$6,$7,$8,$9,$10,$12,$13,$15,$16,$18;}')
+ fi
+
+ local title=$(get_title "$1")
+ print_output "$info" "$title" "${@:$#}"
+ return 0
+}
+
+all_info() {
+ local output=$(echo "${@:$#}" | grep -oE -m1 "^(report|json)$")
+ [ -z "$output" ] && output="report"
+
+ local cmds=
+ if [ "$1" = "now" ]; then
+  cmds=("os_usage" "network_stat")
+ else
+  cmds=("os" "system" "cpu" "memory" "memory_module" "disk" "disk_part" "sata" "usb" "usb_full" "pci" "device" "port" "port_detail" "network")
+ fi
+
+ local opt=
+ local info=
+ local data=
+ for (( i=0; i<${#cmds[@]}; i++ )); do
+  cmd="${cmds[i]}"
+  opt=""
+  if echo "$cmd" | grep -q "_"; then
+   opt=$(echo "$cmd" | cut -d"_" -f2)
+   cmd=$(echo "$cmd" | cut -d"_" -f1)
+  fi
+  cmd=$(echo "${cmd}_info ${opt} ${output}" | sed 's/json/jsonraw/' | xargs)
+  data=$(${cmd} 2>/dev/null)
+  [ -z "$data" ] && continue
+
+  if [ -z "$info" ]; then
+   info="${data}"
+  else
+   if [ "$output" = "json" ]; then
+    info+=",$data"
+   else
+    info+="\n$data"
+   fi
+  fi
+ done
+
+ local uuid=$(system_uuid)
+ if [ "$output" = "json" ]; then
+  echo "[{\"System UUID\":\"$uuid\"},${info}]" | jq 2>/dev/null
+ else
+  info="> System UUID : $uuid\n$info"
+  echo -e "$info"
+ fi
+
+ return 0
+}
+
+install() {
+ local install_type=""
+ if [[ "$(which apt 2>/dev/null)" =~ "apt" ]]; then
+  install_type="apt"
+ elif [[ "$(which yum 2>/dev/null)" =~ "yum" ]]; then
+  install_type="yum"
+ else
+  return 1
+ fi
+
+ local install_app=""
+
+ if ! exists gawk; then
+  ${install_type} -y install gawk
+ fi
+
+ if ! exists sed; then
+  ${install_type} -y install sed
+ fi
+
+ if ! exists dmidecode; then
+  ${install_type} -y install dmidecode
+ fi
+
+ if ! exists lspci; then
+  ${install_type} -y install pciutils
+ fi
+
+ if ! exists lsusb; then
+  ${install_type} -y install usbutils
+ fi
+
+ if ! exists lscpu; then
+  ${install_type} -y install util-linux
+ fi
+
+ if ! exists jq; then
+  ${install_type} -y install jq
+ fi
+
+ if ! exists dig; then
+  if [ "${install_type}" = "yum" ]; then
+   install_app="bind-utils"
+  else
+   install_app="dnsutils"
+  fi
+  ${install_type} -y install ${install_app}
+ fi
+
+ return 0
+}
+
+help() {
+echo "Ellucy Sysinfo $VERSION
+Copyright: Jack Nam (jacknam@ellucy.com)
+
+Required:
+gawk, sed, dmidecode, lsusb, lspci, lscpu, jq, dig
+
+Commands:
+os (usage) (report|json)      operating system or usage info
+system (report|json)          system info including BIOS, MB, Chassis
+cpu (report|json)             cpu info
+memory (module) (report|json) memory or memory module info
+sata (report|json)            sata port and disk info
+disk (part) (report|json)     disk or partition info
+pci (report|json)             pci and pcie info by slot
+port (detail) (report|json)   port including socket or slot info
+device (report|json)          device info on onboard, pcie, usb
+usb (full) (report|json)      usb info by port or attached devices
+network (stat) (report|json)  network info or statistics
+all (now) (report|json)       get full or current system info
+uuid                          get system uuid
+help                          help usage
+
+Examples:
+esysinfo os report
+esysinfo os usage json
+esysinfo cpu
+esysinfo cpu report
+esysinfo memory
+esysinfo memory report
+esysinfo memory module report
+esysinfo usb
+esysinfo usb report
+esysinfo usb full report
+esysinfo all report
+esysinfo all now
+"
+
+ return 0
+}
+
+if ! install; then
+ exit 1
+fi
+
+case "$command" in
+ cpu)
+  cpu_info "${@:2}"
+  ;;
+ memory)
+  memory_info "${@:2}"
+  ;;
+ disk)
+  disk_info "${@:2}"
+  ;;
+ network)
+  network_info "${@:2}"
+  ;;
+ sata)
+  sata_info "${@:2}"
+  ;;
+ pci)
+  pci_info "${@:2}"
+  ;;
+ port)
+  port_info "${@:2}"
+  ;;
+ device)
+  device_info "${@:2}"
+  ;;
+ usb)
+  usb_info "${@:2}"
+  ;;
+ system)
+  system_info "${@:2}"
+  ;;
+ os)
+  os_info "${@:2}"
+  ;;
+ uuid)
+  system_uuid
+  ;;
+ all)
+  all_info "${@:2}"
+  ;;
+ help)
+  help
+  ;;
+ *)
+  echo "Ellucy Sysinfo $VERSION"
+esac
+
+exit 0

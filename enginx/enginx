@@ -1,0 +1,1888 @@
+#!/bin/bash
+#
+# developed by jacknam@ellucy.com
+#
+VERSION=0.1
+NGINX_PATH="/etc/nginx"
+ENGINX_PATH="/opt/ellucy/enginx"
+ENGINX_CONFIG="${ENGINX_PATH}/enginx.conf"
+GEOIP2_PATH="/opt/geoip2"
+command="$1"
+mode="$2"
+value="$3"
+nginx_repo=""
+
+exists() {
+ command -v "$1" >/dev/null 2>&1
+}
+
+check_internet() {
+ if ip route 2>/dev/null | grep -q default; then
+  nc -zw1 1.1.1.1 53 >/dev/null 2>&1 && return 0
+ fi
+ return 1
+}
+
+get_version() {
+ local ver=""
+ if exists nginx; then
+  local search_target=""
+  if [ "$PREFER_APP" = "basic" ]; then
+   search_target="nginx "
+  else
+   search_target="nginx-${PREFER_APP}"
+  fi
+  ver=$(dpkg -l | grep nginx | awk '{ split($3,v,"-"); print $2" "v[1]; }' | grep "^${search_target}")
+ fi
+ echo $ver
+}
+
+add_nginx_repo() {
+ rm -f /etc/apt/sources.list.d/nginx*
+
+ if [ "$PREFER_VER" != "latest" ]; then
+  return 0
+ fi
+
+ local install_apps=""
+ local test_command=""
+ for req_app in curl lsb-release gnupg2 ca-certificates software-properties-common; do
+  if [ "$req_app" = "gnupg2" ]; then
+   test_command="gpg2"
+  elif [ "$req_app" = "ca-certificates" ]; then
+   test_command="update-ca-certificates"
+  elif [ "$req_app" = "software-properties-common" ]; then
+   test_command="add-apt-repository"
+  else
+   test_command="$req_app"
+  fi
+
+  if ! exists $test_command; then
+   install_apps+=" $req_app"
+  fi
+ done
+
+ if [ -n "$install_apps" ]; then
+  echo "$install_apps" | xargs apt-get -y install
+ fi
+
+ # nginx official public key
+ if [ -z "$(apt-key fingerprint ABF5BD827BD9BF62 2>/dev/null)" ]; then
+  apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys ABF5BD827BD9BF62
+  #curl -fsSL https://nginx.org/keys/nginx_signing.key | sudo apt-key add -
+ fi
+
+ # launchpad nginx team public key
+ if [ -z "$(apt-key fingerprint 00A6F0A3C300EE8C 2>/dev/null)" ]; then
+  apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 00A6F0A3C300EE8C
+  # http://ppa.launchpad.net/nginx/
+ fi
+
+ if [ "$PREFER_APP" = "basic" ]; then
+  local os_code=($(lsb_release -a 2>/dev/null | xargs | awk '{ print tolower($3" "$NF); }'))
+  if [ "${PREFER_CHANNEL}" = "mainline" ]; then
+   repo="http://nginx.org/packages/mainline/${os_code[0]} ${os_code[1]} nginx"
+   echo -e "deb ${repo}\ndeb-src ${repo}" > "/etc/apt/sources.list.d/nginx-${os_code[0]}-mainline-${os_code[1]}.list"
+  else
+   repo="http://nginx.org/packages/${os_code[0]} ${os_code[1]} nginx"
+   echo -e "deb ${repo}\ndeb-src ${repo}" > "/etc/apt/sources.list.d/nginx-${os_code[0]}-stable-${os_code[1]}.list"
+  fi
+ else
+  add-apt-repository -y ppa:nginx/${PREFER_CHANNEL}
+ fi
+
+ return 0
+}
+
+init_nginx_repo() {
+ local target_repo=""
+ local repos=$(find /etc/apt/sources.list.d -type f -name nginx-*.list)
+ if [ -n "$repos" ]; then
+  local repo_updated=""
+  target_repo=$(echo "$repos" | grep "$PREFER_CHANNEL" | head -1)
+  if [ -z "$target_repo" ] || [ -z "$(cat $target_repo | xargs)" ]; then
+   add_nginx_repo
+   repo_updated="1"
+  fi
+  local other_repos=$(echo "$repos" | grep -v "$PREFER_CHANNEL" | xargs)
+  if [ -n "$other_repos" ]; then
+   rm -f "$other_repos"
+   repo_updated="1"
+  fi
+  [ -n "repo_updated" ] && apt-get update
+ else
+  add_nginx_repo
+  apt-get update
+  target_repo=$(find /etc/apt/sources.list.d -type f -name nginx*.list | grep "$PREFER_CHANNEL" | head -1)
+ fi
+
+ if [ "$PREFER_APP" != "basic" ] && [ -z "$target_repo" ]; then
+  return 1
+ fi
+ nginx_repo="$target_repo"
+ return 0
+}
+
+change_repo() {
+ local target_repo="$1"
+ if [ -z "$target_repo" ] || [ ! -f "$target_repo" ]; then
+  return 1
+ fi
+ local action="$2"
+ local target="$3"
+
+ local sed_expr=""
+ case "$target" in
+  app)
+   if [ "$action" = "disable" ]; then
+    sed_expr="s/^deb /# deb /g"
+   else
+    sed_expr="s/^#(\s?)deb /deb /g"
+   fi
+   ;;
+  src)
+   if [ "$action" = "disable" ]; then
+    sed_expr="s/^deb-src /# deb-src /g"
+   else
+    sed_expr="s/^#(\s?)deb-src /deb-src /g"
+   fi
+   ;;
+  *) # all
+   if [ "$action" = "disable" ]; then
+    sed_expr="s/^deb/# deb/g"
+   else
+    sed_expr="s/^#(\s?)deb/deb/g"
+   fi
+ esac
+
+ local cur_repo=$(cat "$target_repo")
+ local new_repo=$(echo "$cur_repo" | sed -r "$sed_expr")
+ [ "$cur_repo" = "$new_repo" ] && return 0
+
+ echo "$new_repo" > "$target_repo"
+ apt-get update
+
+ return 0
+}
+
+build_nginx() {
+ local build_target=$(echo "$1" | grep -oE "^(light|full|extras)$")
+ init_nginx_repo || return 1
+ change_repo "$nginx_repo" enable all
+
+ local build_path="$ENGINX_PATH/build"
+ [ ! -d "$build_path" ] && mkdir -p "$build_path"
+
+ local c_ver="$(apt-cache policy nginx-extras | grep "Candidate:" | head -1 | awk '{ split($2,v,"-"); print v[1]; }' | xargs)"
+ local working_path="$build_path/nginx-$c_ver"
+ if [ ! -d "$working_path" ]; then
+  cd "$build_path"
+  apt-get -y build-dep nginx
+  apt-get -y source nginx
+ fi
+
+ local rule_file="$working_path/debian/rules"
+ if [ -f "$rule_file" ]; then
+  if [ -f "$rule_file.dist" ]; then
+   cp -f "$rule_file.dist" "$rule_file"
+  else
+   cp "$rule_file"{,.dist}
+  fi
+
+  build_target="${build_target:-extras}"
+  local rules=$(cat "$rule_file" | sed "s/^FLAVOURS \:\=.*$/FLAVOURS := ${build_target}/")
+  local conf=$(echo "$rules" | sed -n "/^${build_target}_configure_flags/,/^$/p")
+  local module_path="$ENGINX_PATH/modules"
+  if [ -d "$module_path" ]; then
+   local dynamic_modules=$(ls -d "$module_path"/* 2>/dev/null)
+   if [ -n "$dynamic_modules" ]; then
+    local add_module=$(echo "$dynamic_modules" | xargs printf -- '\t\t\t--add-dynamic-module=%s \\\n' | sed '$s/ \\//')
+    local exclude_module=$(echo "$dynamic_modules" | awk -F"/" '{ print $NF; }' | sed 's/_/-/g' | awk -F"-" '{ print $2"-"$3; }' | xargs | sed 's/ /|/g')
+    conf=$(echo "$conf" | egrep -v "add-dynamic-module=.*($exclude_module)" | sed '$s/ \\//')
+    conf="${conf} \\"$'\n'"${add_module}"
+   fi
+  fi
+  rules=$(echo "$rules" | sed -r "/^${build_target}_configure_flags/,/^$/d" | sed "/^\%\:$/i $(echo "$conf" | sed 's/\\/\\\\\\/g')\n")
+  rules=$(echo "$rules" | sed "/^override_dh_install\:$/i override_dh_shlibdeps:\n\tdh_shlibdeps --dpkg-shlibdeps-params=--ignore-missing-info\n")
+  echo "$rules" > "$rule_file"
+
+  apt-get -y install build-essential dpkg-dev quilt libpcre++-dev libssl-dev libxslt1-dev libperl-dev libgd-dev libexif-dev libhiredis-dev libgeoip-dev libmaxminddb-dev >/dev/null 2>&1
+  cd "$working_path"
+  if dpkg-buildpackage -b -uc -us; then
+   local release_path="$ENGINX_PATH/release/nginx-$c_ver/$build_target"
+   rm -rf "$release_path"
+   mkdir -p "$release_path"
+   mv "$build_path"/*.deb "$release_path"/
+   for flag in $(echo "light full extras" | sed "s/$build_target//" | xargs); do
+    rm -f "$release_path/nginx-${flag}_"*.deb
+   done
+   echo "[Info] nginx-${build_target}_${c_ver} has been compiled at ${release_path}"
+   echo "[Info] You can install it with following command"
+   echo "[Command] find ${release_path} -type f -name *.deb -exec dpkg -i {} \;"
+  fi
+ fi
+
+ change_repo "$nginx_repo" disable all
+ return 0
+}
+
+build_modules() {
+ local target="$1"
+ [ -z "$target" ] && return 1
+
+ local ver=$(nginx -v 2>&1 | cut -d"/" -f2 | xargs)
+ [ -z "$ver" ] && return 1
+
+ local module_path="$ENGINX_PATH/modules"
+ [ ! -d "$module_path" ] && mkdir -p "$module_path"
+
+ if [ "$target" = "all" ]; then
+  module_path=$(ls -d "$module_path"/* 2>/dev/null | xargs)
+  [ -z "$module_path" ] && return 0
+ else
+  module_path="$module_path/$target"
+  [ ! -d "$module_path" ] && return 1
+ fi
+
+ local build_path="$ENGINX_PATH/nginx-$ver"
+ if [ ! -d "$build_path" ]; then
+  wget "https://nginx.org/download/nginx-${ver}.tar.gz" -P "$ENGINX_PATH"
+  tar -zxf "$build_path.tar.gz" -C "$ENGINX_PATH/"
+  rm "$build_path.tar.gz"
+  [ ! -d "$build_path" ] && return 1
+ fi
+
+ local obj_path="$build_path/objs"
+ [ -d "$obj_path" ] && rm -rf "$obj_path"
+
+ local build_option="--with-compat --with-debug"
+ for path in ${module_path}; do
+  build_option="${build_option} --add-dynamic-module=$path"
+ done
+
+ apt-get -y install build-essential libpcre++-dev libssl-dev libxslt1-dev libperl-dev libgd-dev libexif-dev libhiredis-dev libgeoip-dev libmaxminddb-dev >/dev/null 2>&1
+
+ cd "$build_path"
+ ./configure ${build_option} || return 1
+ make modules
+
+ local module_name=""
+ local conf_name=""
+ for module in $(ls "$obj_path"/*.so 2>/dev/null | xargs); do
+  chmod 644 "$module"
+  mv -f "$module" /usr/lib/nginx/modules/
+  module_name=$(echo "$module" | rev | cut -d"/" -f1 | rev)
+  conf_name=$(echo "$module_name" | sed 's/^ngx/mod/' | sed -r 's/(\-|\_)module\.so$/.conf/' | sed 's/_/-/g')
+  echo "load_module modules/$module_name;" > "/etc/nginx/modules-available/$conf_name"
+  ln -sf "/etc/nginx/modules-available/$conf_name" "/etc/nginx/modules-enabled/50-$conf_name"
+ done
+ rm -rf "$obj_path"
+
+ return 0
+}
+
+set_modules() {
+ local target="$1"
+ [ -z "$target" ] && return 1
+
+ local preset="$2"
+ local git_install=""
+
+ if ! exists git; then
+  apt-get -y install git
+ fi
+
+ local module_path="$ENGINX_PATH/modules"
+ [ ! -d "$module_path" ] && mkdir -p "$module_path"
+
+ if [ "$target" = "update" ]; then
+  module_path=$(ls -d "$module_path"/* 2>/dev/null | xargs)
+  [ -z "$module_path" ] && return 0
+ elif [ "$target" = "preset" ]; then
+  local preset_file="$ENGINX_PATH/preset.conf"
+  if [ ! -f "$preset_file" ]; then
+cat << EOF > "$preset_file"
+geoip2|https://github.com/leev/ngx_http_geoip2_module.git
+dav-ext|https://github.com/arut/nginx-dav-ext-module.git
+cache-purge|https://github.com/nginx-modules/ngx_cache_purge.git
+upload|https://github.com/fdintino/nginx-upload-module.git
+vod|https://github.com/kaltura/nginx-vod-module.git
+EOF
+  fi
+  local preset_git=$(cat "$preset_file" | grep "^$preset|" | cut -d"|" -f2)
+  [ -z "$preset_git" ] && return 1
+  target=$(echo "$preset_git" | rev | cut -d"/" -f1 | rev | sed 's/\.git$//')
+  module_path="$module_path/$target"
+  if [ ! -d "$module_path" ]; then
+   cd "$(echo "$module_path" | rev | cut -d"/" -f2- | rev)"
+   git clone --recursive "$preset_git" || return 1
+   git_install="1"
+  fi
+ else
+  module_path="$module_path/$target"
+  [ ! -d "$module_path" ] && return 1
+ fi
+
+ local status=""
+ for path in ${module_path}; do
+  [[ "$path" == *"geoip2"* ]] && install_geoip2
+  cd "$path"
+  if [ -z "$git_install" ]; then
+   status=$(git pull 2>/dev/null || echo "error");
+   if [ "$status" = "error" ] || [ "$status" = "Already up to date." ]; then
+    continue
+   fi
+  fi
+  target=$(echo "$path" | rev | cut -d"/" -f1 | rev)
+  build_modules "$target"
+ done
+
+ nginx -qt && systemctl reload nginx
+ return 0
+}
+
+set_nginx() {
+ local reset="$1"
+
+ if ! exists nginx; then
+  echo "Error: currently nginx is not installed"
+  return 1
+ fi
+
+ if [ ! -d "/etc/nginx" ]; then
+  echo "Error: nginx is not installed properly"
+  return 1
+ fi
+
+ local check_dir=""
+
+ for d in conf.d modules-enabled sites-available sites-enabled snippets; do
+  check_dir="/etc/nginx/${d}"
+  if [ ! -d "$check_dir" ]; then
+   mkdir "$check_dir"
+   chmod -R 755 "$check_dir"
+  fi
+ done
+
+ if [ ! -d "/etc/nginx/modules" ]; then
+  if [ ! -d "/usr/lib/nginx/modules" ]; then
+   mkdir -p /usr/lib/nginx/modules
+   chmod -R 755 /usr/lib/nginx/modules
+  fi
+  ln -sf /usr/lib/nginx/modules /etc/nginx/modules
+ fi
+
+ local nginx_lib="/var/lib/nginx"
+ if [ ! -d "${nginx_lib}" ]; then
+  mkdir -p "${nginx_lib}"
+ fi
+
+ for d in body fastcgi proxy scgi uwsgi; do
+  check_dir="${nginx_lib}/${d}"
+  if [ ! -d "$check_dir" ]; then
+   mkdir "$check_dir"
+   chown -R www-data:root "$check_dir"
+   chmod -R 700 "$check_dir"
+  fi
+ done
+
+ if [ ! -f /etc/nginx/nginx.conf.dist ] || [ "$reset" = "true" ]; then
+  local php_handler=$(find /run/php/ -name php*.sock | head -1 | xargs)
+  if [ -n "$php_handler" ]; then
+   php_handler="upstream php-handler { server unix:${php_handler}; }"
+  fi
+
+  [ ! -f /etc/nginx/nginx.conf.dist ] && mv /etc/nginx/nginx.conf{,.dist}
+cat << EOF > /etc/nginx/nginx.conf
+user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+include /etc/nginx/modules-enabled/*.conf;
+worker_rlimit_nofile 100000;
+
+events {
+ worker_connections 4000;
+ multi_accept on;
+ use epoll;
+}
+
+http {
+ open_file_cache max=200000 inactive=20s;
+ open_file_cache_valid 30s;
+ open_file_cache_min_uses 2;
+ open_file_cache_errors on;
+
+ sendfile on;
+ tcp_nopush on;
+ tcp_nodelay on;
+
+ reset_timedout_connection on;
+ send_timeout 2;
+ keepalive_timeout 30;
+ keepalive_requests 100000;
+ server_tokens off;
+
+ client_body_timeout 10;
+ client_body_temp_path /var/lib/nginx/body 1 2;
+
+ types_hash_max_size 2048;
+ server_names_hash_bucket_size 64;
+ # server_name_in_redirect off;
+
+ variables_hash_max_size 1024;
+ variables_hash_bucket_size 128;
+
+ include /etc/nginx/mime.types;
+ default_type application/octet-stream;
+
+ ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
+ ssl_prefer_server_ciphers on;
+ ssl_session_tickets off;
+
+ #access_log /var/log/nginx/access.log;
+ access_log off;
+ error_log /var/log/nginx/error.log crit;
+
+ gzip on;
+ # gzip_static on;
+ gzip_min_length 10240;
+ gzip_comp_level 1;
+ gzip_vary on;
+ gzip_disable msie6;
+ gzip_proxied expired no-cache no-store private auth;
+ gzip_types
+  text/css
+  text/javascript
+  text/xml
+  text/plain
+  text/x-component
+  application/javascript
+  application/x-javascript
+  application/json
+  application/xml
+  application/rss+xml
+  application/atom+xml
+  font/truetype
+  font/opentype
+  application/vnd.ms-fontobject
+  image/svg+xml;
+
+ ${php_handler}
+
+ map \$http_host \$this_host {
+  "" \$host;
+  default \$http_host;
+ }
+
+ include /etc/nginx/conf.d/*.conf;
+ include /etc/nginx/sites-enabled/*;
+}
+EOF
+ fi
+
+ if [ ! -f /etc/nginx/proxy_params.dist ] || [ "$reset" = "true" ]; then
+  [ ! -f /etc/nginx/proxy_params.dist ] && mv /etc/nginx/proxy_params{,.dist}
+cat << EOF > /etc/nginx/proxy_params
+# important (e.g. if not set proxy_max_temp_file_size 0; then download will be limited under 1GB https://trac.nginx.org/nginx/ticket/1472)
+proxy_set_header Host \$this_host;
+proxy_set_header X-Real-IP \$remote_addr;
+proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto \$the_scheme;
+
+proxy_set_header Connection \$proxy_connection;
+proxy_set_header X-Forwarded-Host \$the_host;
+proxy_set_header X-Forwarded-Port \$server_port;
+proxy_http_version 1.1;
+proxy_set_header Upgrade \$http_upgrade;
+proxy_set_header X-NginX-Proxy true;
+
+#proxy_intercept_errors on;
+proxy_redirect off;
+proxy_connect_timeout 60;
+proxy_send_timeout 60;
+proxy_read_timeout 60;
+proxy_max_temp_file_size 0;
+
+#proxy_buffering on;
+proxy_buffer_size 128k;
+proxy_buffers 256 16k;
+proxy_busy_buffers_size 256k;
+proxy_temp_file_write_size 256k;
+EOF
+ fi
+
+ if [ ! -f "/var/www/html/index.html" ]; then
+cat << EOF > "/var/www/html/index.html"
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to Ellucy!</title>
+<style>
+ body {
+  width: 35em;
+  margin: 0 auto;
+  font-family: Tahoma, Verdana, Arial, sans-serif;
+ }
+</style>
+</head>
+<body>
+<h1>Welcome to Ellucy!</h1>
+<p><a href="http://www.ellucy.com/">www.ellucy.com</a>.</p>
+<p><em>Thank you for visiting Ellucy.</em></p>
+</body>
+</html>
+EOF
+ fi
+
+ install_ssl
+ nginx_config
+ nginx_snippet
+ build_modules all
+ systemctl restart nginx
+
+ return 0
+}
+
+nginx_config() {
+ [ ! -d /etc/nginx/conf.d ] && return 1
+ local reset="$1"
+
+ if [ ! -f /etc/nginx/conf.d/log_format.conf ] || [ "$reset" = "true" ]; then
+cat << EOF > /etc/nginx/conf.d/log_format.conf
+log_subrequest off;
+log_format main '\$remote_addr - \$remote_user [\$time_local] "\$request" \$status \$body_bytes_sent "\$http_referer" "\$http_user_agent" "\$http_x_forwarded_for"';
+log_format proxy '\$http_x_forwarded_for - \$remote_user [\$time_local] "\$request" \$status \$body_bytes_sent "\$http_referer" "\$http_user_agent" "\$remote_addr"';
+log_format proxylog '[\$time_local] \$remote_addr - \$remote_user - \$server_name to: \$upstream_addr: \$request upstream_response_time \$upstream_response_time msec \$msec request_time \$request_time \$proxy_host \$proxy_port \$query_string';
+map \$request_uri \$loggable {
+ default 0;
+ ~(.*\\.php) 1;
+ ~(^\\/)\$ 1;
+}
+EOF
+ fi
+
+ if [ ! -f /etc/nginx/conf.d/proxy_map.conf ] || [ "$reset" = "true" ]; then
+cat << EOF > /etc/nginx/conf.d/proxy_map.conf
+map \$http_x_forwarded_proto \$the_scheme {
+ default \$http_x_forwarded_proto;
+ "" \$scheme;
+}
+
+map \$http_x_forwarded_host \$the_host {
+ default \$http_x_forwarded_host;
+ "" \$this_host;
+}
+
+map \$http_upgrade \$proxy_connection {
+ default upgrade;
+ "" close;
+}
+EOF
+ fi
+
+ if [ ! -f /etc/nginx/conf.d/real-ip.conf ] || [ "$reset" = "true" ]; then
+cat << EOF > /etc/nginx/conf.d/real-ip.conf
+#only if proxy from 1.1.123.1
+#set_real_ip_from 1.1.123.1;
+real_ip_header X-Forwarded-For;
+EOF
+ fi
+
+ if [ ! -f /etc/nginx/conf.d/fastcgi_cache.conf ] || [ "$reset" = "true" ]; then
+  mkdir -p /usr/local/nginx/fastcgi_cache
+cat << EOF > /etc/nginx/conf.d/fastcgi_cache.conf
+fastcgi_cache_path /usr/local/nginx/fastcgi_cache levels=1:2 keys_zone=fastcgi_cache:10m inactive=60m max_size=5G use_temp_path=off;
+EOF
+ fi
+
+ if [ ! -f /etc/nginx/conf.d/proxy_cache.conf ] || [ "$reset" = "true" ]; then
+  mkdir -p /usr/local/nginx/proxy_cache
+cat << EOF > /etc/nginx/conf.d/proxy_cache.conf
+proxy_cache_path /usr/local/nginx/proxy_cache levels=1:2 keys_zone=proxy_cache:10m inactive=60m max_size=5G use_temp_path=off;
+EOF
+ fi
+
+ return 0
+}
+
+nginx_snippet() {
+ [ ! -d /etc/nginx/snippets ] && return 1
+ local reset="$1"
+
+ if [ ! -f /etc/nginx/snippets/geoip2.conf ] || [ "$reset" = "true" ]; then
+cat << EOF > /etc/nginx/snippets/geoip2.conf
+# only if having geoip2 module at /opt/geoip2
+# should be placed in http block
+geoip2 ${GEOIP2_PATH}/GeoLite2-Country.mmdb {
+ auto_reload 1d;
+ \$geoip2_metadata_country_build metadata build_epoch;
+ \$geoip2_data_country_code default=KR country iso_code;
+ \$geoip2_data_country_name "default=Republic of Korea" country names en;
+}
+
+geoip2 ${GEOIP2_PATH}/GeoLite2-City.mmdb {
+ auto_reload 1d;
+ \$geoip2_data_city_name default=Seoul city names en;
+ \$geoip2_data_latitude location latitude;
+ \$geoip2_data_longitude location longitude;
+ \$geoip2_data_time_zone location time_zone;
+ \$geoip2_data_continent_code default=AS continent code;
+ \$geoip2_data_continent_name continent names en;
+ \$geoip2_data_subdivision_code subdivisions 0 iso_code;
+ \$geoip2_data_subdivision_name subdivisions 0 names en;
+}
+EOF
+ fi
+
+ if [ ! -f /etc/nginx/snippets/fastcgi-geoip2.conf ] || [ "$reset" = "true" ]; then
+cat << EOF > /etc/nginx/snippets/fastcgi-geoip2.conf
+# using in server location block (e.g. include snippets/fastcgi-geoip2.conf)
+# GEOIP2 Country
+fastcgi_param COUNTRY_CODE \$geoip2_data_country_code;
+fastcgi_param COUNTRY_NAME \$geoip2_data_country_name;
+
+# GEOIP2 City
+fastcgi_param CITY_NAME \$geoip2_data_city_name;
+fastcgi_param IP_LATITUDE \$geoip2_data_latitude;
+fastcgi_param IP_LONGITUDE \$geoip2_data_longitude;
+fastcgi_param IP_TIMEZONE \$geoip2_data_time_zone;
+fastcgi_param CONTINENT_CODE \$geoip2_data_continent_code;
+fastcgi_param CONTINENT_NAME \$geoip2_data_continent_name;
+fastcgi_param SUBDIVISION_CODE \$geoip2_data_subdivision_code;
+fastcgi_param SUBDIVISION_NAME \$geoip2_data_subdivision_name;
+EOF
+ fi
+
+ if [ ! -f /etc/nginx/snippets/proxy-geoip2.conf ] || [ "$reset" = "true" ]; then
+cat << EOF > /etc/nginx/snippets/proxy-geoip2.conf
+# using in server proxy location block (e.g. include snippets/proxy-geoip2.conf)
+# GEOIP2 Country
+proxy_set_header COUNTRY_CODE \$geoip2_data_country_code;
+proxy_set_header COUNTRY_NAME \$geoip2_data_country_name;
+
+# GEOIP2 City
+proxy_set_header CITY_NAME \$geoip2_data_city_name;
+proxy_set_header IP_LATITUDE \$geoip2_data_latitude;
+proxy_set_header IP_LONGITUDE \$geoip2_data_longitude;
+proxy_set_header IP_TIMEZONE \$geoip2_data_time_zone;
+proxy_set_header CONTINENT_CODE \$geoip2_data_continent_code;
+proxy_set_header CONTINENT_NAME \$geoip2_data_continent_name;
+proxy_set_header SUBDIVISION_CODE \$geoip2_data_subdivision_code;
+proxy_set_header SUBDIVISION_NAME \$geoip2_data_subdivision_name;
+EOF
+ fi
+
+ if [ ! -f /etc/nginx/snippets/proxy-external-media.conf ] || [ "$reset" = "true" ]; then
+cat << EOF > /etc/nginx/snippets/proxy-external-media.conf
+resolver 1.1.1.1 1.0.0.1 valid=3600s ipv6=off;
+proxy_set_header Referer "";
+proxy_pass_request_body off;
+proxy_pass_request_headers off;
+
+add_header Pragma public;
+add_header Cache-Control "public, must-revalidate, proxy-revalidate";
+expires max;
+
+log_subrequest on;
+EOF
+ fi
+
+ if [ ! -f /etc/nginx/snippets/proxy-cache.conf ] || [ "$reset" = "true" ]; then
+cat << EOF > /etc/nginx/snippets/proxy-cache.conf
+proxy_cache proxy_cache;
+proxy_cache_key \$host\$uri\$is_args\$args;
+proxy_cache_valid 200 301 302 30m;
+add_header X-Proxy-Cache \$upstream_cache_status;
+EOF
+ fi
+
+ if [ ! -f /etc/nginx/snippets/fastcgi-cache.conf ] || [ "$reset" = "true" ]; then
+cat << EOF > /etc/nginx/snippets/fastcgi-cache.conf
+fastcgi_cache fastcgi_cache;
+fastcgi_cache_valid 60m;
+fastcgi_cache_methods GET HEAD;
+fastcgi_cache_key \$http_cookie\$request_method\$host\$request_uri;
+fastcgi_cache_use_stale error timeout invalid_header http_500;
+fastcgi_ignore_headers Cache-Control Expires Set-Cookie;
+EOF
+ fi
+
+ if [ ! -f /etc/nginx/snippets/proxy-cache-cookie.conf ] || [ "$reset" = "true" ]; then
+cat << EOF > /etc/nginx/snippets/proxy-cache-cookie.conf
+# https://stackoverflow.com/questions/5100883/why-nginx-does-not-cache-my-content
+proxy_ignore_headers X-Accel-Expires;
+proxy_ignore_headers Expires;
+proxy_ignore_headers Set-Cookie;
+proxy_ignore_headers Cache-Control;
+proxy_hide_header Set-Cookie;
+proxy_hide_header Cache-Control;
+EOF
+ fi
+
+ if [ ! -f /etc/nginx/snippets/proxy-security.conf ] || [ "$reset" = "true" ]; then
+cat << EOF > /etc/nginx/snippets/proxy-security.conf
+# hash sizing (only use whe header hash size error)
+#proxy_headers_hash_max_size 1024;
+#proxy_headers_hash_bucket_size 128;
+
+proxy_set_header X-NginX-Proxy true;
+
+proxy_hide_header Strict-Transport-Security;
+proxy_set_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload;";
+
+proxy_hide_header X-Frame-Options;
+proxy_set_header X-Frame-Options "SAMEORIGIN";
+
+proxy_hide_header X-Content-Type-Options;
+proxy_set_header X-Content-Type-Options "nosniff";
+
+proxy_hide_header X-XSS-Protection;
+proxy_set_header X-XSS-Protection "1; mode=block";
+
+proxy_hide_header X-Robots-Tag;
+proxy_set_header X-Robots-Tag none;
+
+proxy_hide_header X-Download-Options;
+proxy_set_header X-Download-Options noopen;
+
+proxy_hide_header X-Permitted-Cross-Domain-Policies;
+proxy_set_header X-Permitted-Cross-Domain-Policies none;
+
+proxy_hide_header Referrer-Policy;
+proxy_set_header Referrer-Policy "no-referrer";
+EOF
+ fi
+
+ if [ ! -f /etc/nginx/snippets/security.conf ] || [ "$reset" = "true" ]; then
+cat << EOF > /etc/nginx/snippets/security.conf
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload;" always;
+add_header X-Frame-Options "SAMEORIGIN";
+add_header X-Content-Type-Options "nosniff";
+add_header X-XSS-Protection "1; mode=block";
+add_header X-Robots-Tag none;
+add_header X-Download-Options noopen;
+add_header X-Permitted-Cross-Domain-Policies none;
+add_header Referrer-Policy "no-referrer";
+EOF
+ fi
+
+ if [ ! -f /etc/nginx/snippets/security-noframe.conf ] || [ "$reset" = "true" ]; then
+cat << EOF > /etc/nginx/snippets/security-noframe.conf
+# only for no SAMEORIGIN required
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload;" always;
+add_header X-Content-Type-Options "nosniff";
+add_header X-XSS-Protection "1; mode=block";
+add_header X-Robots-Tag none;
+add_header X-Download-Options noopen;
+add_header X-Permitted-Cross-Domain-Policies none;
+add_header Referrer-Policy "no-referrer";
+EOF
+ fi
+
+ if [ ! -f /etc/nginx/snippets/security-content.conf ] || [ "$reset" = "true" ]; then
+cat << EOF > /etc/nginx/snippets/security-content.conf
+# place server or location block
+add_header Content-Security-Policy "default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval' www.google-analytics.com *.google.com *.google.co.kr *.googleapis.com *.gstatic.com *.googlesyndication.com *.cloudflare.com *.bootstrapcdn.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com *.bootstrapcdn.com; img-src 'self' data: blob: www.google.com www.google.co.kr www.google-analytics.com *.cloudflare.com *.ellucy.com *.ellupic.com *.namsec.co.kr; object-src 'self' blob:; media-src 'self' blob:; font-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com *.bootstrapcdn.com; connect-src 'self' blob:; child-src 'self' 'unsafe-inline' data: *.ellucy.com *.ellupic.com *.namsec.co.kr; frame-ancestors 'none'; form-action 'none'; upgrade-insecure-requests; block-all-mixed-content;" always;
+EOF
+ fi
+
+ if [ ! -f /etc/nginx/snippets/maptile.conf ] || [ "$reset" = "true" ]; then
+cat << EOF > /etc/nginx/snippets/maptile.conf
+# apikey required from www.ngii.go.kr
+location ~ ^/maptile/([a-zA-Z0-9_]+)/([A-Z0-9]+)/([0-9]+)/([0-9]+).([a-zA-Z]+)\$ {
+ valid_referers none blocked server_names ellupic.com *.ellupic.com;
+ if (\$invalid_referer) {
+  rewrite (.*) /no_image.png redirect;
+ }
+
+ include proxy_params;
+
+ proxy_buffering on; #if the site is fast enough, then off
+ proxy_http_version 1.1;
+ proxy_set_header Connection "";
+ proxy_pass_request_body off;
+ proxy_pass_request_headers off;
+
+ proxy_cache PROXY_CACHE;
+ proxy_cache_key "\$proxy_host\$uri\$is_args\$args";
+ proxy_cache_lock on;
+ proxy_cache_valid 200 1y;
+ expires max;
+
+ set \$vars "apikey=E64E1C0E7D16FE81C8980091ED94CB1E&URL=http://210.117.198.62:8081/2015_map/\$1/\$2/\$3/\$4.\$5";
+ rewrite ^ /proxys/proxy/proxyTile.jsp?\$vars break;
+ proxy_pass http://map.ngii.go.kr;
+
+ access_log off;
+ log_not_found off;
+ add_header Pragma public;
+ add_header Cache-Control "public, must-revalidate, proxy-revalidate";
+ proxy_hide_header Content-Type;
+ add_header Content-Type \$proxy_content_type;
+}
+EOF
+ fi
+
+ return 0
+}
+
+install_ssl() {
+ local reset="$1"
+
+ if ! exists openssl; then
+  apt-get -y install openssl
+ fi
+
+ if [ ! -f /etc/ssl/dhparam.pem ]; then
+  openssl dhparam -out /etc/ssl/dhparam.pem 2048
+  chmod 400 /etc/ssl/*.pem
+ fi
+
+ if [ ! -f /etc/nginx/snippets/ssl.conf ] || [ "$reset" = "true" ]; then
+cat << EOF > /etc/nginx/snippets/ssl.conf
+ssl_dhparam /etc/ssl/dhparam.pem;
+#ssl_dhparam /etc/ssl/dhparam4096.pem;
+
+ssl_session_timeout 1d;
+ssl_session_cache shared:SSL:50m;
+ssl_session_tickets off;
+
+ssl_protocols TLSv1.2;
+ssl_ciphers ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256;
+ssl_prefer_server_ciphers on;
+ssl_ecdh_curve secp384r1;
+
+ssl_stapling on;
+ssl_stapling_verify on;
+resolver 1.1.1.1 1.0.0.1 valid=300s;
+resolver_timeout 30s;
+EOF
+ fi
+
+ return 0
+}
+
+install_php() {
+ local reset="$1"
+ if exists php; then
+  if [ "$reset" != "true" ]; then
+   return 0
+  fi
+ fi
+
+ apt-get -y update
+ local target_ver=$(apt-cache policy php* | egrep "php[0-9].[0-9].*-dev" | head -1 | sed -r 's/(php|-dev|\:)//g')
+ [ -z "$target_ver" ] && return 1
+
+ apt-get -y install php${target_ver}-dev php${target_ver}-fpm \
+ php${target_ver}-mysql \
+ php${target_ver}-curl \
+ php${target_ver}-intl \
+ php${target_ver}-mbstring \
+ php${target_ver}-json \
+ php${target_ver}-xml \
+ php${target_ver}-zip \
+ php${target_ver}-memcache \
+ php${target_ver}-redis \
+ php${target_ver}-gd \
+ php${target_ver}-imagick \
+ php${target_ver}-ldap \
+ php${target_ver}-smbclient
+
+ local fpm_restart=""
+ if [ ! -f /etc/php/${target_ver}/fpm/php.ini.dist ] || [ "$reset" = "true" ]; then
+  [ ! -f /etc/php/${target_ver}/fpm/php.ini.dist ] && mv /etc/php/${target_ver}/fpm/php.ini{,.dist}
+  local php_ini=$(sed '/^;/d;/^$/d' /etc/php/${target_ver}/fpm/php.ini.dist)
+
+local ini_custom="[PHP]
+memory_limit=1024M
+post_max_size=4096M
+upload_max_filesize=4G
+max_file_uploads=100
+max_execution_time=300
+max_input_time=600
+cgi.fix_pathinfo=0
+error_reporting=E_ALL & ~E_DEPRECATED & ~E_STRICT & ~E_NOTICE
+[Session]
+session.save_handler=redis
+session.save_path="tcp://127.0.0.1:6379"
+[mbstring]
+mbstring.language=UTF-8
+mbstring.internal_encoding=UTF-8
+mbstring.http_input=UTF-8
+mbstring.http_output=UTF-8
+[opcache]
+opcache.enable=1
+opcache.enable_cli=1
+opcache.interned_strings_buffer=8
+opcache.max_accelerated_files=10000
+opcache.memory_consumption=128
+opcache.save_comments=1
+opcache.revalidate_freq=1
+[Date]
+date.timezone=Asia/Seoul"
+
+  local item=""
+  local section=""
+  local section_content=""
+  while read line; do
+   if [ "${line:0:1}" = "[" ]; then
+    if [ -n "$section" ]; then
+     section_content=$(echo "${section}${section_content}" | sed -r "s/(\/|\&)/\\\\\1/g")
+     section=$(echo "$section" | sed -r "s/(\]|\[)/\\\\\1/g")
+     php_ini=$(echo "$php_ini" | sed "s/$section/$section_content/")
+     section_content=""
+    fi
+    section="$line"
+   else
+    item=$(echo "$line" | cut -d"=" -f1)
+    php_ini=$(echo "$php_ini" | grep -v "$item")
+    section_content="$section_content\n$line"
+   fi
+  done <<< "$ini_custom"
+  echo "$php_ini" > /etc/php/${target_ver}/fpm/php.ini
+  fpm_restart="1"
+ fi
+
+ if [ ! -f /etc/php/${target_ver}/fpm/pool.d/www.conf.dist ] || [ "$reset" = "true" ]; then
+  [ ! -f /etc/php/${target_ver}/fpm/pool.d/www.conf.dist ] && mv /etc/php/${target_ver}/fpm/pool.d/www.conf{,.dist}
+  local pool_conf=$(sed 's/^\;env\[/env\[/g' /etc/php/${target_ver}/fpm/pool.d/www.conf.dist)
+  echo "$pool_conf" > /etc/php/${target_ver}/fpm/pool.d/www.conf
+  fpm_restart="1"
+ fi
+
+ if [ ! -f /etc/php/${target_ver}/mods-available/redis.ini ]; then
+  echo "extension=redis.so" > /etc/php/${target_ver}/mods-available/redis.ini
+  ln -sf /etc/php/${target_ver}/mods-available/redis.ini /etc/php/${target_ver}/fpm/conf.d/20-redis.ini
+  ln -sf /etc/php/${target_ver}/mods-available/redis.ini /etc/php/${target_ver}/cli/conf.d/20-redis.ini
+  fpm_restart="1"
+ fi
+
+ if [ -n "$fpm_restart" ]; then
+  systemctl restart php${target_ver}-fpm
+ fi
+
+ if ! exists argon2; then
+  apt-get -y install argon2 libargon2-0 libargon2-0-dev
+ fi
+}
+
+install_mariadb() {
+ local reset="$1"
+ if exists mysql; then
+  if [ "$reset" != "true" ]; then
+   return 0
+  fi
+ fi
+
+ if ! exists mariadb; then
+ 	apt-get -y install mariadb-server
+ fi
+
+ local i_ver=$(mariadb --version 2>/dev/null | grep -oE "Distrib(.*)-MariaDB" | grep -oE "[0-9]{1,3}" | head -2 | xargs | tr " " ".")
+ if [ "$MARIADB_VER" != "$i_ver" ]; then
+  local os_code=($(lsb_release -a 2>/dev/null | xargs | awk '{ print tolower($3" "$NF); }'))
+  if [ -n "${os_code[0]}" ]; then
+   local mariadb_repo="/etc/apt/sources.list.d/mariadb-${os_code[0]}-${MARIADB_VER}-${os_code[1]}.list"
+   if [ ! -f "$mariadb_repo" ]; then
+    rm -f /etc/apt/sources.list.d/mariadb*
+    if [ -z "$(apt-key fingerprint 0xF1656F24C74CD1D8 2>/dev/null)" ]; then
+     apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 0xF1656F24C74CD1D8
+    fi
+    local repo_addr="[arch=amd64] http://ftp.kaist.ac.kr/mariadb/repo/${MARIADB_VER}/${os_code[0]} ${os_code[1]} main"
+    #local repo_addr="[arch=amd64] http://ftp.harukasan.org/mariadb/repo/${MARIADB_VER}/${os_code[0]} ${os_code[1]} main"
+    echo -e "deb ${repo_addr}\n#deb-src ${repo_addr}" > "$mariadb_repo"
+    apt-get -y update
+   fi
+  fi
+
+  apt-get -y install mariadb-server
+  if ! exists mariadb; then
+   return 1
+  fi
+
+  find /etc/mysql/ -name '*.cnf' -print0 | xargs -0 grep -lZE '^(bind-address|log)' | xargs -rt -0 sed -Ei 's/^(bind-address|log)/#&/'
+  systemctl restart mysql
+
+  if [ ! -e "/etc/mysql/enginx_mysql_secure_installation" ]; then
+   touch "/etc/mysql/enginx_mysql_secure_installation"
+   local cur_admin=($(who am i | grep -v "tty" | tail -1 | awk '{gsub(/[()]/,""); print $1" "$NF}' | xargs))
+   local admin_id=${cur_admin[0]:-root}
+   local admin_host=${cur_admin[1]:-%}
+
+   # since mariadb 10.4.3, no necessary to set the password of root@localhost due to plugin
+   # SET PASSWORD FOR 'root'@'localhost'=PASSWORD('$(openssl rand -base64 32)') ;
+
+read -r -d '' init_sql <<-EOSQL || true
+DELETE FROM mysql.user WHERE USER='root' AND HOST NOT IN ('localhost') ;
+GRANT ALL ON *.* TO 'root'@'localhost' WITH GRANT OPTION ;
+CREATE USER IF NOT EXISTS '${admin_id}'@'${admin_host}' IDENTIFIED BY 'helloworld' ;
+GRANT ALL ON *.* TO '${admin_id}'@'${admin_host}' WITH GRANT OPTION ;
+DROP DATABASE IF EXISTS test ;
+FLUSH PRIVILEGES ;
+EOSQL
+   mysql -uroot -hlocalhost -e "$init_sql"
+  fi
+
+  systemctl enable mysql
+ fi
+
+ init_mariadb
+
+ return 0
+}
+
+init_mariadb() {
+ local server_cnf="/etc/mysql/mariadb.conf.d/50-server.cnf"
+ local dist_path="/etc/mysql/mariadb.dist.conf.d"
+ if [ -f "$server_cnf" ] && [ -d "$dist_path" ]; then
+ 	return 0
+ fi
+
+ mkdir -p "$dist_path"
+ if [ -f "$server_cnf" ] && [ ! -f "$dist_path/50-server.cnf" ]; then
+ 	mv -f "$server_cnf" "${dist_path}/"
+ fi
+
+ local init_conf=$(cat "$server_cnf" 2>/dev/null | grep -v "^#" | grep -v "^$")
+ if [ -z "$init_conf" ]; then
+cat << EOF > "$server_cnf"
+[mysqld]
+user                    = mysql
+pid-file                = /run/mysqld/mysqld.pid
+socket                  = /run/mysqld/mysqld.sock
+#bind-address           = 127.0.0.1
+bind-address            = 0.0.0.0
+port                    = 3306
+basedir                 = /usr
+datadir                 = /var/lib/mysql
+tmpdir                  = /tmp
+lc-messages-dir         = /usr/share/mysql
+query_cache_size        = 16M
+expire_logs_days        = 10
+character-set-server    = utf8mb4
+collation-server        = utf8mb4_general_ci
+innodb_large_prefix = on
+innodb_file_format = barracuda
+innodb_file_per_table = true
+EOF
+ else
+  echo "$init_conf" | grep -vE "(innodb_large_prefix|innodb_file_format|innodb_file_per_table)"\
+   | sed 's/\[mysqld\]/[mysqld]\ninnodb_large_prefix = on\ninnodb_file_format = barracuda\ninnodb_file_per_table = true/' > "$server_cnf"
+ fi
+
+cat << EOF > "/etc/mysql/mariadb.conf.d/51-charset.cnf"
+[client]
+default-character-set=utf8mb4
+
+[mysql]
+default-character-set=utf8mb4
+
+[mysqldump]
+default-character-set=utf8mb4
+
+[mysqld]
+skip-character-set-client-handshake
+character-set-server=utf8mb4
+collation-server=utf8mb4_unicode_ci
+#init-connect=SET NAMES 'utf8mb4' COLLATE 'utf8mb4_unicode_ci'
+EOF
+
+ systemctl restart mariadb
+
+ return 0
+}
+
+install_redis() {
+ local reset="$1"
+ if exists redis-cli; then
+  if [ "$reset" != "true" ]; then
+   return 0
+  fi
+ fi
+
+ apt-get -y install redis-server
+ systemctl enable redis-server
+
+ if [ ! -f /etc/redis/redis.conf.dist ]; then
+  cp /etc/redis/redis.conf{,.dist}
+  sed -i -r '/^appendonly no/c\appendonly yes' /etc/redis/redis.conf
+cat << EOF >> /etc/redis/redis.conf
+maxmemory 128mb
+maxmemory-policy allkeys-lru
+EOF
+  systemctl restart redis-server
+ fi
+
+ return 0
+}
+
+install_geoip2() {
+ local update="$1"
+ [ ! -d "$GEOIP2_PATH" ] && mkdir -p "$GEOIP2_PATH"
+
+ if ! exists mmdblookup || [ "$update" = "true" ]; then
+  apt-get -y install libmaxminddb0 libmaxminddb-dev mmdb-bin >/dev/null 2>&1
+ fi
+
+ if [ ! -f "${GEOIP2_PATH}/GeoLite2-Country.mmdb" ] || [ "$update" = "true" ]; then
+  wget http://geolite.maxmind.com/download/geoip/database/GeoLite2-Country.mmdb.gz -P "$GEOIP2_PATH"
+  gunzip -f "$GEOIP2_PATH/GeoLite2-Country.mmdb.gz"
+ fi
+
+ if [ ! -f "${GEOIP2_PATH}/GeoLite2-City.mmdb" ] || [ "$update" = "true" ]; then
+  wget http://geolite.maxmind.com/download/geoip/database/GeoLite2-City.mmdb.gz -P "$GEOIP2_PATH"
+  gunzip -f "$GEOIP2_PATH/GeoLite2-City.mmdb.gz"
+ fi
+
+ if [ ! -f "${GEOIP2_PATH}/GeoLite2-ASN.mmdb" ] || [ "$update" = "true" ]; then
+  wget http://geolite.maxmind.com/download/geoip/database/GeoLite2-ASN.tar.gz -P "$GEOIP2_PATH"
+  tar -xzvf "$GEOIP2_PATH/GeoLite2-ASN.tar.gz" && rm "$GEOIP2_PATH/GeoLite2-ASN.tar.gz"
+  mv ${GEOIP2_PATH}/GeoLite2-ASN_*/GeoLite2-ASN.mmdb ${GEOIP2_PATH}/ && chown root:root ${GEOIP2_PATH}/GeoLite2-ASN.mmdb && rm -rvf $GEOIP2_PATH/GeoLite2-ASN_*
+ fi
+
+ return 0
+}
+
+check_certbot() {
+ if ! exists nginx; then
+  echo "currently nginx is not installed"
+  return 1
+ fi
+ install_ssl
+
+ if ! exists certbot; then
+  apt-get -y install certbot
+  exists certbot || return 1
+ fi
+
+ if ! exists letsencrypt; then
+  apt-get -y install letsencrypt
+ fi
+
+ if [ ! -d /var/lib/letsencrypt/.well-known ]; then
+  mkdir -p /var/lib/letsencrypt/.well-known
+  chgrp www-data /var/lib/letsencrypt
+  chmod g+s /var/lib/letsencrypt
+ fi
+
+ if [ ! -f /etc/nginx/snippets/letsencrypt.conf ]; then
+cat << EOF > /etc/nginx/snippets/letsencrypt.conf
+location ^~ /.well-known/acme-challenge/ {
+ allow all;
+ root /var/lib/letsencrypt/;
+ default_type "text/plain";
+ try_files \$uri =404;
+}
+EOF
+ fi
+
+ local cron_conf="/etc/cron.d/certbot"
+ if [ ! -f "$cron_conf" ] || [ -z "$(cat $cron_conf | grep "^# ellucy rule")" ]; then
+cat << EOF > /etc/cron.d/certbot
+# ellucy rule : every sunday at 4:10 am renewal try
+# 0 */12 * * * root test -x /usr/bin/certbot -a \! -d /run/systemd/system && perl -e 'sleep int(rand(43200))' && certbot -q rene
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+10 4 * * 0 root /usr/local/bin/certbot renew --quiet --post-hook "/bin/systemctl reload nginx" > /dev/null 2>&1
+EOF
+ fi
+
+ return 0
+}
+
+wildcard_cert() {
+ local domain=$(echo "$1" | grep -P "^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9](?:\.[a-zA-Z]{2,})+$")
+ if [ -z "$domain" ]; then
+  echo "Error: you need to specify the domain of cert to issue"
+  return 1
+ fi
+
+ if ! check_certbot; then
+  echo "Error: certbot is not installed properly"
+  return 1
+ fi
+
+ local replace=""
+ local confirm=""
+ local answer=""
+ if [ -f "/etc/letsencrypt/renewal/$domain.conf" ]; then
+  confirm=$(echo -e "System found exising cert for $domain.\nWould you like to replace it with new one issuing a new cert? [(y)es/(n)o]: ")
+  read -t 5 -p "$confirm" answer
+  echo
+  if [ "$answer" != "y" ]; then
+   return 1
+  fi
+  replace="1"
+ fi
+
+ local update_required=""
+ local email="$2"
+ local api_key="$3"
+
+ local secret_ini="/root/.secrets/cloudflare.$domain.ini"
+ if [ -f "$secret_ini" ]; then
+  local credential=$(cat "$secret_ini")
+  if [ -n "$credential" ]; then
+   if [ -n "$email" ] && [ -n "$api_key" ]; then
+    update_required="1"
+   else
+    email=$(echo "$credential" | grep "dns_cloudflare_email" | cut -d"=" -f2 | sed 's/\"//g' | xargs)
+    api_key=$(echo "$credential" | grep "dns_cloudflare_api_key" | cut -d"=" -f2 | sed 's/\"//g' | xargs)
+   fi
+  fi
+ else
+  mkdir -p /root/.secrets
+  chmod 0700 /root/.secrets
+
+  local answer=""
+  echo -n "Please type cloudflare account email [email | (c)ancel] : "
+  read -t 20 answer
+  [ -z "$answer" ] && echo
+  if ! echo "$answer" | grep -qEo "@[a-z]+."; then
+   echo "[Error] you cancelled or typed wrong email"
+   return 1
+  fi
+  email=$(echo "$answer" | sed 's/ //g' | xargs)
+
+  answer=""
+  echo -n "Please type cloudflare account api key [key | (c)ancel] : "
+  read -t 20 answer
+  [ -z "$answer" ] && echo
+  if [ "${#answer}" != "37" ]; then
+   echo "[Error] you cancelled or typed wrong api key"
+   return 1
+  fi
+  api_key=$(echo "$answer" | sed 's/ //g' | xargs)
+
+  update_required="1"
+ fi
+
+ email=$(echo "$email" | grep -oE "\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,6}\b")
+ if [ -z "$email" ] || [ -z "$api_key" ]; then
+  echo "Please input cloudflare email and api key."
+  return 1
+ fi
+
+ local verified=""
+ local output=$(curl -X GET "https://api.cloudflare.com/client/v4/zones" \
+ -H "X-Auth-Email: ${email}" \
+ -H "X-Auth-Key: ${api_key}" \
+ -H "Content-Type: application/json")
+ if [ -n "$output" ]; then
+  output=$(echo $output | sed 's/\,\"type\".*//' | cut -d"{" -f3- | sed 's/\"//g' | tr "," "\n")
+  if echo "$output" | grep -q "^id:"; then
+   if [ "$(echo "$output" | grep "^name:" | cut -d":" -f2 | xargs)" = "$domain" ]; then
+    verified="1"
+   fi
+  fi
+ fi
+
+ if [ -z "$verified" ]; then
+ 	rm -f "$secret_ini"
+  echo "Please input valid cloudflare email and api key."
+  return 1
+ fi
+
+ if [ -n "$replace" ]; then
+  certbot delete --cert-name "$domain"
+ fi
+
+ if [ -n "$update_required" ]; then
+cat << EOF > "$secret_ini"
+dns_cloudflare_email = "${email}"
+dns_cloudflare_api_key = "${api_key}"
+EOF
+  chmod 0400 "$secret_ini"
+ fi
+
+ apt-get -y install build-essential libssl-dev libffi-dev python3-dev python3-pip >/dev/null 2>&1
+ pip3 install pyyaml >/dev/null 2>&1
+ pip3 install certbot-dns-cloudflare >/dev/null 2>&1
+ pip3 install --upgrade cryptography >/dev/null 2>&1
+
+ certbot certonly --dns-cloudflare --dns-cloudflare-credentials ${secret_ini} -d ${domain},*.${domain} --preferred-challenges dns-01
+
+ return 0
+}
+
+domain_cert() {
+ local email=$(echo "$1" | grep -oE "\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,6}\b")
+ if [ -z "$email" ]; then
+  echo "Error: you need to enter a email address for issuing a cert first"
+  return 1
+ fi
+
+ local target_domain=""
+ local domains=${@:2}
+ for domain in domains; do
+  domain=$(echo "$domain" | grep -P "^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9](?:\.[a-zA-Z]{2,})+$")
+  if [ -n "$domain" ]; then
+   [ -f "/etc/letsencrypt/renewal/$domain.conf" ] && continue
+   target_domain="$target_domain -d $domain"
+  fi
+ done
+ target_domain=$(echo "$target_domain" | xargs)
+
+ if [ -z "$target_domain" ]; then
+  echo "Error: no domain is specified or the cert of domain is alwardy exists"
+  return 1
+ fi
+
+ if ! check_certbot; then
+  echo "Error: certbot is not installed properly"
+  return 1
+ fi
+
+ certbot certonly --agree-tos --email ${email} --webroot -w /var/lib/letsencrypt/ ${target_domain}
+
+ return 0
+}
+
+delete_cert() {
+ local certs=$(certbot certificates 2>/dev/null)
+ echo "$certs" | grep -v "^-" | awk 'BEGIN{i=1;} {if(index($0,"Certificate Name:")){$1="["i"] "$1;i+=1;} print $0; }'
+ certs=$(echo "$certs" | grep "Certificate Name:")
+ [ -z "$certs" ] && return 1
+
+ local number=$(echo "$certs" | wc -l)
+ local answer=""
+ echo
+ echo -n "Which certificate would like delete enable? Type the number. [number | (c)ancel] : "
+ read -t 10 answer
+ [ -z "$answer" ] && echo
+ answer=$(echo "$answer" | grep -Eo "[0-9]{1,3}" | head -1 | xargs)
+ if [ -z "$answer" ] || [ "${answer:0:1}" = "0" ] || [ "$answer" -gt "$number" ]; then
+  echo "[Error] you typed wrong number or cancelled"
+  return 1
+ fi
+
+ local delete_target=$(echo "$certs" | sed -n "${answer}p" | cut -d":" -f2 | xargs)
+ [ -z "$delete_target" ] && return 1
+
+ answer=""
+ echo -n "Would like to delete the certificate of \"$delete_target\"? [(y)es | (n)o] : "
+ read -t 5 answer
+ [ -z "$answer" ] && echo
+ if [ "$answer" != "y" ]; then
+  echo "Cancelled"
+  return 0
+ fi
+
+ certbot delete --cert-name "$delete_target"
+
+ echo "[Info] the certificate of \"$delete_target\" has been deleted"
+ return 0
+}
+
+install_nginx() {
+ init_nginx_repo || return 1
+ change_repo "$nginx_repo" enable app
+
+ local target_app=$([ "$PREFER_APP" = "basic" ] && echo "nginx" || echo "nginx-${PREFER_APP}")
+ local c_ver=$(apt-cache policy "$target_app" | grep "Candidate:" | head -1 | awk '{ split($2,v,"-"); print v[1]; }' | xargs)
+ if [ -z "$c_ver" ]; then
+  echo "There is no candidate of $target_app to be installed"
+  change_repo "$nginx_repo" disable all
+  return 1
+ fi
+
+ local need_install=""
+ local ver=($(get_version))
+ local app="${ver[0]}"
+ local i_ver="${ver[1]}"
+
+ if [ -z "$app" ] || [ "$i_ver" != "$c_ver" ]; then
+  need_install="1"
+ fi
+
+ if [ -n "$need_install" ]; then
+  if systemctl status nginx >/dev/null 2>&1; then
+   read -rp "[Warning] nginx is currently running. Install requires stop this nignx process. Procceed? (y|N) : " answer
+   answer=$(echo "$answer" | awk '{ print tolower($0); }')
+   if [ "$answer" != "y" ]; then
+    echo "nginx installation has been cancelled"
+    change_repo "$nginx_repo" disable all
+    return 1
+   fi
+   systemctl stop nginx
+  fi
+  apt-get -y remove nginx nginx-light nginx-full nginx-extras
+  apt-get -y autoremove
+  apt-get -y install "$target_app"
+  set_nginx
+ fi
+
+ change_repo "$nginx_repo" disable all
+ return 0
+}
+
+install_lemp() {
+ install_mariadb
+ install_redis
+ install_php
+}
+
+status() {
+ local ver=($(get_version))
+ if [ -z "$ver" ]; then
+  echo "[Info] currently nginx is not installed"
+  ver=("nginx" "not installed")
+ fi
+
+ local ver_config=$(cat "$ENGINX_CONFIG" 2>/dev/null)
+ local c_ver=$(apt-cache policy "${ver[0]}" | grep "Candidate:" | head -1 | awk '{ split($2,v,"-"); print v[1]; }' | xargs)
+ local status=$(systemctl status nginx >/dev/null 2>&1 && echo "active running" || echo "stopped or error")
+ local enabled_sites=$(ls /etc/nginx/sites-enabled 2>/dev/null | xargs printf -- '%s\n')
+ local enabled_modules=$(ls /etc/nginx/modules-enabled 2>/dev/null | xargs printf -- '%s\n' | egrep -v ".(removed|disabled)$")
+
+ local installed_pkg=$(dpkg -l | grep -E "(php|redis|mariadb)")
+ local search_word=$(echo -e "mariadb-server-core\nredis-server\nphp.*-cli")
+ local installed_lemp=$(
+for app in php mariadb redis-server; do
+ echo -n "$app: "
+ if command -v $app >/dev/null 2>&1; then
+  echo "$installed_pkg" | grep $(echo "$search_word" | grep $app) | awk '{ print $3; }' | sed -r -e "s/.*\://" -e "s/(\-|\+).*//"
+ else
+   echo "Not installed"
+ fi
+done)
+
+printf "
+[Ellucy nginx status report]
+
+1. nginx Version Config:
+%s
+
+2. Installation:
+  - module: %s
+  - installed: %s
+  - candidate: %s
+
+3. Status: %s
+
+4. Enabled sites:
+%s
+
+5. Enabled modules:
+%s
+
+6. Installed LEMP:
+%s
+
+" "${ver_config}" "${ver[0]}" "${ver[1]}" "${c_ver}" "$status" "$enabled_sites" "$enabled_modules" "$installed_lemp"
+
+ return 0
+}
+
+control() {
+ local exec="$1"
+ if ! exists nginx; then
+  echo "currently nginx is not installed"
+  return 1
+ fi
+
+ if [ "$exec" = "stop" ]; then
+  systemctl stop nginx >/dev/null 2>&1
+  echo "Warning: nginx has been stopped"
+  return 0
+ fi
+
+ local nginx_check=$(nginx -t 2>&1)
+ if [ "$exec" = "test" ]; then
+  echo "$nginx_check"
+  return 0
+ fi
+
+ if echo "$nginx_check" | grep -q "test failed"; then
+  echo "Check your nginx configuration"
+  echo "$nginx_check"
+  return 1
+ fi
+
+ if [ "$exec" = "start" ]; then
+  systemctl restart nginx >/dev/null 2>&1
+ elif [ "$exec" = "reload" ]; then
+  if systemctl status nginx >/dev/null 2>&1; then
+   systemctl reload nginx
+  else
+   systemctl start nginx
+  fi
+ fi
+
+ return 0
+}
+
+enable() {
+ local target="$1"
+ local disabled=""
+
+ if [ "$target" = "site" ]; then
+  local avail=$(ls /etc/nginx/sites-available | egrep -v ".(dist|bak)$" | xargs printf -- '%s\n')
+  local enabled=$(ls /etc/nginx/sites-enabled | xargs printf -- '%s\n')
+  while read line; do
+   if ! echo "$enabled" | grep -qE "^${line}$"; then
+    disabled="$disabled $line"
+   fi
+  done <<< "$avail"
+  if [ -n "$disabled" ]; then
+   disabled=$(echo "$disabled" | xargs printf -- '%s\n')
+  fi
+ elif [ "$target" = "module" ]; then
+  disabled=$(ls /etc/nginx/modules-enabled | xargs printf -- '%s\n' | grep ".disabled$")
+ else
+  echo "Error: you need to specify a enable target. (site|module)"
+  return 1
+ fi
+
+ if [ -z "$disabled" ]; then
+  echo "no $target to be enabled"
+  return 1
+ fi
+
+ local number=0
+ while read line; do
+  (( number++ ))
+  echo "[$number] $line"
+ done <<< "$disabled"
+
+ local answer=""
+ echo -n "Which $target would like to enable? Type the number. [number | (c)ancel] : "
+ read -t 10 answer
+ [ -z "$answer" ] && echo
+ answer=$(echo "$answer" | grep -Eo "[0-9]{1,3}" | head -1 | xargs)
+ if [ -z "$answer" ] || [ "${answer:0:1}" = "0" ] || [ "$answer" -gt "$number" ]; then
+  echo "[Error] you typed wrong number or cancelled"
+  return 1
+ fi
+
+ local reload=""
+ local enable_target=$(echo "$disabled" | sed -n "${answer}p" | xargs)
+ answer=""
+ echo -n "Would like to enable the $target of \"$enable_target\"? [(y)es | (n)o] : "
+ read -t 5 answer
+ [ -z "$answer" ] && echo
+ if [ "$answer" = "y" ]; then
+  if [ "$target" = "site" ]; then
+   ln -sf "/etc/nginx/sites-available/$enable_target" /etc/nginx/sites-enabled/
+  elif [ "$target" = "module" ]; then
+   local replace_name=$(basename "$enable_target" .disabled)
+   mv -f "/etc/nginx/modules-enabled/$enable_target" "/etc/nginx/modules-enabled/$replace_name"
+  fi
+  reload="1"
+  echo "[Info] the $target of \"$enable_target\" has been enabled"
+ else
+  echo "Cancelled"
+  return 0
+ fi
+
+ if [ -n "$reload" ]; then
+  if nginx -qt; then
+   if systemctl status nginx >/dev/null 2>&1; then
+    systemctl reload nginx
+   fi
+  else
+   echo "[Warning] nginx configuration has been failed due to this enabling. Please check the log above."
+  fi
+ fi
+
+ return 0
+}
+
+disable() {
+ local target="$1"
+ local enabled=""
+
+ if [ "$target" = "site" ]; then
+  enabled=$(ls /etc/nginx/sites-enabled | xargs printf -- '%s\n')
+ elif [ "$target" = "module" ]; then
+  enabled=$(ls /etc/nginx/modules-enabled | xargs printf -- '%s\n' | grep ".conf$")
+ else
+  echo "Error: you need to specify a disable target. (site|module)"
+  return 1
+ fi
+
+ if [ -z "$enabled" ]; then
+  echo "no $target enabled"
+  return 1
+ fi
+
+ local number=0
+ while read line; do
+  (( number++ ))
+  echo "[$number] $line"
+ done <<< "$enabled"
+
+ local answer=""
+ echo -n "Which $target would like to disable? Type the number. [number | (c)ancel] : "
+ read -t 10 answer
+ [ -z "$answer" ] && echo
+ answer=$(echo "$answer" | grep -Eo "[0-9]{1,3}" | head -1 | xargs)
+ if [ -z "$answer" ] || [ "${answer:0:1}" = "0" ] || [ "$answer" -gt "$number" ]; then
+  echo "[Error] you typed wrong number or cancelled"
+  return 1
+ fi
+
+ local reload=""
+ local disable_target=$(echo "$enabled" | sed -n "${answer}p" | xargs)
+ answer=""
+ echo -n "Would like to disable the $target of \"$disable_target\"? [(y)es | (n)o] : "
+ read -t 5 answer
+ [ -z "$answer" ] && echo
+ if [ "$answer" = "y" ]; then
+  if [ "$target" = "site" ]; then
+   rm -f "/etc/nginx/sites-enabled/$disable_target"
+  elif [ "$target" = "module" ]; then
+   mv -f "/etc/nginx/modules-enabled/$disable_target"{,.disabled}
+  fi
+  reload="1"
+  echo "[Info] the $target of \"$disable_target\" has been disabled"
+ else
+  echo "Cancelled"
+  return 0
+ fi
+
+ if [ -n "$reload" ]; then
+  if nginx -qt; then
+   if systemctl status nginx >/dev/null 2>&1; then
+    systemctl reload nginx
+   fi
+  else
+   echo "[Warning] nginx configuration has been failed due to this enabling. Please check the log above."
+  fi
+ fi
+
+ return 0
+}
+
+set_config() {
+ if [ -z "$mode" ] || [ -z "$value" ]; then
+  echo "[Error] required arguments missing"
+  return 1
+ fi
+
+ mode=($(echo "$mode" | awk '{ print toupper($1); }'))
+ if [ -z "$(echo "$mode" | grep -oE "^(PREFER_CHANNEL|PREFER_APP|PREFER_VER|MARIADB_VER)$")" ]; then
+  echo "[Error] You can set within these configs (prefer_channel|prefer_app|prefer_ver|mariadb_ver)"
+  return 1
+ fi
+
+ value=$(echo "$value" | awk '{ print tolower($1); }')
+ local valid_limit=""
+ if [ "$mode" = "PREFER_CHANNEL" ] && [ -z "$(echo "$value" | grep -oE "^(mainline|stable)$")" ]; then
+  valid_limit="mainline|stable"
+ elif [ "$mode" = "PREFER_APP" ] && [ -z "$(echo "$value" | grep -oE "^(extras|full|light|basic)$")" ]; then
+  valid_limit="extras|full|light|basic"
+ elif [ "$mode" = "PREFER_VER" ] && [ -z "$(echo "$value" | grep -oE "^(latest|production)$")" ]; then
+  valid_limit="latest|production"
+ elif [ "$mode" = "MARIADB_VER" ] && [ -z "$(echo "$value" | grep -oE "^10.[0-9]$")" ]; then
+  valid_limit="10.x"
+ fi
+ if [ -n "$valid_limit" ]; then
+  echo "[Error] You can set ${mode} within these values (${valid_limit})"
+  return 1
+ fi
+
+ if cat "$ENGINX_CONFIG" | grep -q "^${mode}=${value}$"; then
+  echo "[Info] configuration is same"
+  return 0
+ fi
+
+ sed -i -r "s/^${mode}=.*/${mode}=${value}/" "$ENGINX_CONFIG"
+ echo "[Info] configuration has been changed"
+ cat "$ENGINX_CONFIG"
+
+ return 0
+}
+
+load_config() {
+ if [ -f "$ENGINX_CONFIG" ]; then
+  source "$ENGINX_CONFIG"
+ fi
+
+ if [ -z "$(echo "$PREFER_CHANNEL" | grep -oE "^(mainline|stable)$")" ]; then
+  PREFER_CHANNEL="stable"
+ fi
+
+ if [ -z "$(echo "$PREFER_APP" | grep -oE "^(extras|full|light|basic)$")" ]; then
+  PREFER_APP="basic"
+ fi
+
+ if [ -z "$(echo "$PREFER_VER" | grep -oE "^(latest|production)$")" ]; then
+  PREFER_VER="production"
+ fi
+
+ if [ -z "$(echo "$MARIADB_VER" | grep -oE "^10.[0-9]$")" ]; then
+  MARIADB_VER="10.4"
+ fi
+
+read -r -d '' enginx_conf <<-EOL || true
+PREFER_CHANNEL=${PREFER_CHANNEL}
+PREFER_APP=${PREFER_APP}
+PREFER_VER=${PREFER_VER}
+MARIADB_VER=${MARIADB_VER}
+EOL
+
+ if [ "$(cat ${ENGINX_CONFIG} 2>/dev/null)" != "${enginx_conf}" ]; then
+  echo "${enginx_conf}" > "${ENGINX_CONFIG}"
+ fi
+
+ return 0
+}
+
+init_check() {
+ if [ ! -d /etc/apt ]; then
+  echo "Not supported platform"
+  exit 1
+ fi
+
+ if [ $(id -u) -ne 0 ]; then
+  echo "Please run as root"
+  exit 1
+ fi
+
+ if ! check_internet; then
+  echo "Please check your internet connection"
+  exit 1
+ fi
+
+ if [ ! -d "${ENGINX_PATH}" ]; then
+  mkdir -p "${ENGINX_PATH}"
+ fi
+
+ load_config
+
+ return 0
+}
+
+help() {
+echo "Ellucy nginx Helper $VERSION
+Copyright: Jack Nam(jacknam@ellucy.com)
+
+Commands:
+start, stop, reload    start/stop/reload nginx
+test                   test nginx sites-available
+enable, disable        enable/disable nginx site or module
+install, upgrade       install/upgrade nginx with version config
+set_lemp               install MariaDB, PHP, Redis-Server for LEMP Env
+set                    set nginx and mariadb target version
+reset                  reset nginx config, snippet, initial env
+status                 print enginx status and config
+site                   show the list of available sites for nginx
+cert                   set ssl certificates for domain or wildcard with cloudflare
+update                 update components (php, ssl, redis, mariadb, geoip2)
+set_modules            set nginx extra modules as preset using git clone
+build_modules          build nginx extra modules located at $ENGINX_PATH/modules
+build                  build custom nginx with extra modules
+
+Usage:
+enginx (install|upgrade|set_lemp)
+enginx (start|stop|test|reload|status|site)
+enginx reset (config|snippet|nginx)
+enginx update (php|ssl|redis|mariadb|geoip2)
+enginx build (extras|full|light)
+enginx build_modules (all|[the path name of module located at $ENGINX_PATH/modules])
+enginx set_modules (preset|update)
+enginx cert (wildcard|domain|delete) ([domain]|[domains])
+enginx set prefer_channel (mainline|stable)
+enginx set prefer_app (extras|full|light|basic)
+enginx set prefer_ver (latest|production)
+enginx set mariadb_ver (10.1|10.2|...|10.4|10.x)
+enginx (enable|disable) (site|module) [conf at available/enabled site/module]
+"
+ return 0
+}
+
+init_check
+case "$command" in
+ install)
+  install_nginx
+  ;;
+ upgrade)
+  install_nginx
+  ;;
+ set_lemp)
+  install_lemp
+  ;;
+ set)
+  set_config
+  ;;
+ reset)
+  if [ "$mode" = "config" ]; then
+   nginx_config true
+  elif [ "$mode" = "snippet" ]; then
+   nginx_snippet true
+  elif [ "$mode" = "nginx" ]; then
+   set_nginx true
+  else
+   echo "Error: you need to specify a reset target. (config|snippet|nginx)"
+  fi
+  ;;
+ build)
+  build_nginx "$mode"
+  ;;
+ update)
+  if [ "$mode" = "php" ]; then
+   install_php true
+  elif [ "$mode" = "ssl" ]; then
+   install_ssl true
+  elif [ "$mode" = "redis" ]; then
+   install_redis true
+  elif [ "$mode" = "mariadb" ]; then
+   install_mariadb true
+  elif [ "$mode" = "geoip2" ]; then
+   install_geoip2 true
+  else
+   echo "Error: you need to specify a reset target. (php|ssl|redis|mariadb|geoip2)"
+  fi
+  ;;
+ build_modules)
+  build_modules "$mode"
+  ;;
+ set_modules)
+  set_modules ${@:2}
+  ;;
+ status)
+  status
+  ;;
+ help)
+  help
+  ;;
+ start)
+  control "start"
+  ;;
+ stop)
+  control "stop"
+  ;;
+ reload)
+  control "reload"
+  ;;
+ test)
+  control "test"
+  ;;
+ enable)
+  enable "$mode"
+  ;;
+ disable)
+  disable "$mode"
+  ;;
+ site)
+  echo "Available sites in /etc/nginx/sites-available"
+  ls /etc/nginx/sites-available | egrep -v ".(dist|bak)$" | xargs printf -- '%s\n'
+  ;;
+ cert)
+  if [ "$mode" = "wildcard" ]; then
+   wildcard_cert ${@:3}
+  elif [ "$mode" = "domain" ]; then
+   domain_cert ${@:3}
+  elif [ "$mode" = "delete" ]; then
+   delete_cert ${@:3}
+  else
+   echo "Error: you need to specify a cert type first. (wildcard|domain)"
+  fi
+  ;;
+ *)
+  echo "Error: Command not found. (please refer to help. enginx help)"
+esac
+
+exit 0

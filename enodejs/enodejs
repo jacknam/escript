@@ -1,0 +1,557 @@
+#!/bin/bash
+#
+# usage enodejs start|reload|stop|reset|enable|disable|status|check
+# developed by jacknam@ellucy.com
+#
+command="$1"
+ENODEJS_VER="16"
+#ENODEJS_PATH="/etc/enodejs"
+ENODEJS_PATH="/ellucy/escript/enodejs"
+ENODEJS_CONF="$ENODEJS_PATH/enodejs.conf"
+ENODEJS_HOME="$ENODEJS_PATH/.pm2"
+ENODEJS_LIST="$ENODEJS_PATH/service.list"
+ENODEJS_USER="www-data"
+pm2_exec=""
+command_notice=" Use 'enodejs' as command instead of 'pm2'"
+
+if [ $(id -u) -ne 0 ]; then
+ echo "Please run as root"
+ exit 1
+fi
+
+exists() {
+ command -v "$1" >/dev/null 2>&1
+}
+
+check_internet() {
+ if ip route 2>/dev/null | grep -q default; then
+  nc -zw1 1.1.1.1 53 >/dev/null 2>&1 && return 0
+ fi
+ return 1
+}
+
+is_num() {
+ local num="$1"
+ [ "$num" -ge 0 ] 2>/dev/null && return 0
+ return 1
+}
+
+install_confirm() {
+ if ! check_internet; then
+  return 1
+ fi
+
+ local target="$1"
+ local confirm="Would you like to install ${target}? [(y)es/(n)o]: "
+
+ read -t 5 -p "$confirm" answer
+ if [ "$answer" = "y" ]; then
+  echo "Now installing..."
+  return 0
+ else
+  echo
+  echo "Installation cancelled"
+  return 1
+ fi
+
+ return 1
+}
+
+install_nodejs() {
+ if ! install_confirm "nodejs and npm"; then
+  return 1
+ fi
+
+ curl -sL https://deb.nodesource.com/setup_${ENODEJS_VER}.x | bash - 2>/dev/null
+ if [ -f "/etc/apt/sources.list.d/nodesource.list" ]; then
+  apt-get update && apt-get install -y nodejs
+  if [ -n "$(node -v 2>/dev/null)" ] && [ -n "$(npm -v 2>/dev/null)" ]; then
+   return 0
+  fi
+ fi
+
+ return 1
+}
+
+install_pm2() {
+ if ! install_confirm "pm2"; then
+  return 1
+ fi
+
+ npm install pm2 -g && return 0
+ return 1
+}
+
+status() {
+ ${pm2_exec} list
+ echo "$command_notice"
+ return 0
+}
+
+init() {
+ if [ -z "$command" ]; then
+  echo "enodejs v0.1"
+  exit 0
+ elif [ "$command" = "check" ]; then
+  local nodejs_ver=$(node -v 2>/dev/null)
+  local npm_ver=$(npm -v 2>/dev/null)
+  local pm2_ver=$(pm2 -v 2>/dev/null)
+  if [ -n "$pm2_ver" ]; then
+   pm2 kill
+  fi
+
+  if [ -n "$nodejs_ver" ] && [ -n "$npm_ver" ] && [ -n "$pm2_ver" ]; then
+   echo "nodejs version: $nodejs_ver"
+   echo "npm version: $npm_ver"
+   echo "pm2 version: $pm2_ver"
+  else
+   echo "enodejs is not currentlly installed"
+  fi
+  exit 0
+ elif [ "$command" = "services" ]; then
+ 	cat "$ENODEJS_LIST" 2>/dev/null
+  exit 0
+ fi
+
+ if ! exists node; then
+  echo "You need to install nodejs and npm first."
+  install_nodejs || return 1
+ fi
+
+ if ! exists pm2; then
+  echo "You need to install pm2 using npm. Now installing it..."
+  install_pm2 || return 1
+ fi
+
+ [ ! -d "$ENODEJS_PATH" ] && mkdir -p "$ENODEJS_PATH"
+ [ ! -d "$ENODEJS_HOME" ] && mkdir -p "$ENODEJS_HOME"
+ [ -f "$ENODEJS_CONF" ] && source "$ENODEJS_CONF"
+
+ if [ -z "$(id -u $ENODEJS_USER 2>/dev/null)" ]; then
+  ENODEJS_USER=$(who am i | cut -d" " -f1 | xargs)
+ fi
+
+ pm2_exec="sudo -u $ENODEJS_USER PM2_HOME=$ENODEJS_HOME pm2"
+
+ if [ "$(stat -c "%a|%G" "$ENODEJS_HOME")" != "770|$ENODEJS_USER" ]; then
+  chmod -R 770 "$ENODEJS_HOME"
+  chown -R :${ENODEJS_USER} "$ENODEJS_HOME"
+ fi
+
+ if [ -z "$(ls "$ENODEJS_HOME" 2>/dev/null)" ]; then
+  ${pm2_exec} list >/dev/null 2>&1
+  find $ENODEJS_HOME -gid 0 -exec chgrp ${ENODEJS_USER} {} \;
+  find $ENODEJS_HOME -type f ! -perm -g+w -exec chmod g+w {} \;
+ fi
+
+ return 0
+}
+
+get_status() {
+ ${pm2_exec} list 2>/dev/null | grep -E "^│.*[0-9]+" | sed 's/│/|/g;s/| \+/|/g;s/ \+|/|/g;s/^|//;s/|$//'
+ return 0
+}
+
+start_services() {
+ local services="$1"
+ [ -z "$services" ] && return 1
+
+ local mode="$2"
+ local current_status=$(get_status)
+
+ local main=""
+ local path=""
+ local module_path=""
+ local index=""
+ local cluster=""
+ local devmode=""
+ local name=""
+ local pjson=""
+ local pjson_ts=""
+ local pjson_check=""
+ local pjson_result=""
+
+ while read -r line; do
+  [ -z "$line" ] && continue
+  line=( $line )
+  main="${line[0]}"
+  path=""
+  index=""
+  if echo "$main" | grep -q ".js$"; then
+   if [ -f "$main" ]; then
+    index=$(echo "$main" | rev | cut -d"/" -f1 | rev)
+    path=$(echo "$main" | rev | cut -d"/" -f2- | rev)
+   fi
+  fi
+
+  if [ -z "$path" ] || [ ! -d "$path" ]; then
+   echo "[Error] main '$main' not found or wrong"
+   continue
+  fi
+
+  if [ "$(stat -c "%a|%G" "$path")" != "770|$ENODEJS_USER" ]; then
+   chmod -R 770 "$path"
+   chown -R :${ENODEJS_USER} "$path"
+  fi
+
+  module_path="$path/node_modules"
+  if [ -d "$module_path" ] && [ "$(stat -c "%a|%G" "$module_path")" != "770|$ENODEJS_USER" ]; then
+   chmod -R 770 "$module_path"
+   chown -R :${ENODEJS_USER} "$module_path"
+  fi
+
+  pjson="${path}/package.json"
+  if [ ! -f "$pjson" ]; then
+   pjson_result=$(cd "$path"; npm init -y && echo "0" || echo "1")
+   if [ "$pjson_result" = "1" ]; then
+    echo -e "[Error] failed to create '$pjson'\nPlease go to $path and do 'npm init' to create package.json first"
+    continue
+   fi
+  fi
+
+  name=$(cat "$pjson" | grep '"name"' | cut -d'"' -f4)
+  [ -z "$name" ] && continue
+
+  pjson_main=$(cat "$pjson" | grep '"main":' | cut -d'"' -f4)
+  if [ -z "$pjson_main" ] || [ "$pjson_main" != "$index" ]; then
+   new_json=$(cat "$pjson" | grep -v '"main":' | sed "/\"dependencies\":.*/i \ \ \"main\": \"$index\",")
+   echo "$new_json" > "$pjson"
+  fi
+
+  pjson_start=$(cat "$pjson" | grep '"start":' | cut -d'"' -f4 | sed 's/^node //')
+  if [ -z "$pjson_start" ] || [ "$pjson_start" != "$index" ]; then
+   new_json=$(cat "$pjson" | grep -v '"start":' | sed "/\"scripts\": {.*/a \ \ \ \ \"start\": \"node $index\",")
+   echo "$new_json" > "$pjson"
+  fi
+
+  pjson_ts=$(date -r "$pjson" '+%s')
+  pjson_check="${pjson}.check"
+
+  if [ ! -f "$pjson_check" ] || [ "$pjson_ts" != "$(tail -1 "$pjson_check" | xargs)" ]; then
+   pjson_result=$(cd "$path"; npm install && echo "0" || echo "1")
+   if [ "$pjson_result" = "1" ]; then
+    echo "[Error] '$pjson' has dependency problems"
+    continue
+   fi
+   echo "$pjson_ts" > "$pjson_check"
+  fi
+
+  cluster=$(echo "${line[1]}" | grep -oE "^[0-9]{1}$")
+  [ -z "$cluster" ] && cluster="1"
+
+  devmode=$(echo "${line[2]}" | grep -q "^dev$" && echo " --watch" || echo "")
+
+  if [ -n "$current_status" ]; then
+   if echo "$current_status" | grep -q " ${name}$"; then
+    if [ "$mode" = "force" ]; then
+     ${pm2_exec} delete "$name" >/dev/null 2>&1
+    else
+     continue
+    fi
+   fi
+  fi
+
+  #echo "${pm2_exec} start "$main" --name "$name" -o "$path/console.log" -e "$path/error.log" --merge-logs -i ${cluster}${devmode} >/dev/null 2>&1"
+  ${pm2_exec} start "$main" --name "$name" -o "$path/console.log" -e "$path/error.log" --merge-logs -i ${cluster}${devmode} >/dev/null 2>&1
+ done <<< "$services"
+ 
+ ${pm2_exec} save --force
+
+ return 0
+}
+
+start() {
+ local mode=$(echo "$1" | egrep "^(start|reload|boot|sync)$")
+ [ -z "$mode" ] && return 1
+
+ [ ! -f "$ENODEJS_LIST" ] && return 1
+ local services=$(cat "$ENODEJS_LIST" 2>/dev/null | grep -v "^\s*[#;]" | grep -v "^[[:space:]]*$")
+ [ -z "$services" ] && return 1
+
+ if [ "$mode" = "boot" ]; then
+  local dump_file="$ENODEJS_HOME/dump.pm2"
+  if [ -f "$dump_file" ]; then
+   if ${pm2_exec} resurrect >/dev/null 2>&1; then
+    return 0
+   fi
+  fi
+  return 1
+ elif [ "$mode" = "sync" ]; then
+  ${pm2_exec} save --force
+  return 0
+ fi
+
+ local target=$(echo "$2" | xargs)
+ if [ -z "$target" ]; then
+  start_services "$services"
+ else
+  local current_status=$(get_status)
+  if [ -z "$current_status" ]; then
+   echo "[Error] there is no running services"
+   return 1
+  fi
+
+  local filter_status=""
+  if [ "$mode" = "reload" ]; then
+   filter_status=$(echo "$current_status" | grep "|online|")
+  else
+   filter_status=$(echo "$current_status" | grep -v "|online|")
+  fi
+
+  if [ -z "$filter_status" ]; then
+   echo "[Error] there is no target to ${mode}. check its status whether online or error."
+   return 1
+  fi
+
+  local name_filter=""
+  if is_num "$target"; then
+   name_filter="^$target|"
+  else
+   name_filter="|$target|"
+  fi
+
+  local name=$(echo "$filter_status" | grep -m1 "$name_filter" | cut -d"|" -f2 | xargs)
+  if [ -z "$name" ]; then
+   echo "[Error] could not find a target to ${mode}."
+   return 1
+  fi
+
+  local main=$(${pm2_exec} show "$name" 2>/dev/null | grep -m1 "script path" | sed 's/│/|/g' | cut -d"|" -f3 | xargs)
+  services=$(echo "$services" | grep -m1 "^$main")
+  ${pm2_exec} delete "$name" >/dev/null 2>&1
+  ${pm2_exec} save --force
+
+  start_services "$services"
+ fi
+
+ status
+ return 0
+}
+
+stop() {
+ local mode=$(echo "$1" | egrep "^(stop|delete|kill)$")
+ [ -z "$mode" ] && return 1
+
+ if [ "$mode" = "kill" ]; then
+  ${pm2_exec} save --force
+  ${pm2_exec} kill
+  return 0
+ fi
+
+ local current_status=$(get_status)
+ if [ -z "$current_status" ]; then
+  echo "[Error] there is no running services"
+  return 1
+ fi
+
+ local target=$(echo "$2" | xargs)
+ if [ -z "$target" ] || [ "$target" = "all" ]; then
+  ${pm2_exec} ${mode} all >/dev/null 2>&1
+ else
+  local name_filter=""
+  if is_num "$target"; then
+   name_filter="^$target|"
+  else
+   name_filter="|$target|"
+  fi
+
+  local name=$(echo "$current_status" | grep -m1 "$name_filter" | cut -d"|" -f2 | xargs)
+  if [ -z "$name" ]; then
+   echo "[Error] could not find a target to ${mode}."
+   return 1
+  fi
+
+  ${pm2_exec} ${mode} "$target" >/dev/null 2>&1
+ fi
+
+ ${pm2_exec} save --force
+ status
+
+ return 0
+}
+
+service() {
+ local mode=$(echo "$1" | egrep "^(add|remove|update)$")
+ [ -z "$mode" ] && return 1
+
+ local args=( "${@:2}" )
+ local index="${args[0]}"
+ [ -z "$index" ] && return 1
+
+ local f_index="${index:0:1}"
+ if [ "$f_index" = "." ]; then
+  index="$PWD/index.js"
+ elif [ "$f_index" != "/" ]; then
+  index="$PWD/$index"
+ fi
+
+ if [ "${index: -3}" != ".js" ] || [ ! -f "$index" ]; then
+  echo "$index is wrong js file. Please check the js file and try again."
+  return 1
+ fi
+
+ local services=$(cat "$ENODEJS_LIST" 2>/dev/null)
+ local exist=$(echo "$services" | grep "^${index}" | head -1)
+ local name=""
+ if [ "$mode" = "remove" ]; then
+  if [ -n "$exist" ]; then
+   echo "$services" | grep -v "^${index}" > "$ENODEJS_LIST"
+   name=$(${pm2_exec} prettylist | grep -B5 -A5 "pm_exec_path: '${index}'," | grep -m1 "name:" | cut -d"'" -f2 | xargs)
+   if [ -n "$name" ]; then   	
+    ${pm2_exec} delete "$name" >/dev/null 2>&1
+    ${pm2_exec} save --force
+   fi
+  else
+   echo "could not find service remove"
+   return 1
+  fi
+ elif [ "$mode" = "add" ]; then
+  if [ -n "$exist" ]; then
+   echo "service already exists"
+   return 1
+  else
+   local cluster=$(echo "${args[1]}" | grep -oE "^[0-9]{1}$")
+   [ -z "$cluster" ] && cluster="1"
+   local devmode=$(echo "${args[2]}" | grep -q "^dev$" && echo " dev" || echo "")
+   local new_services="$index $cluster$devmode"
+   echo "$new_services" >> "$ENODEJS_LIST"
+   start_services "$new_services"
+  fi
+ elif [ "$mode" = "update" ]; then
+  if [ -n "$exist" ]; then
+   local result=""
+   if service remove "$index"; then
+    if service add "$index" "${@:3}"; then
+     result="true"
+    fi
+   fi
+   if [ "$result" = "true" ]; then
+    echo "successfully updated. enodejs service list is as follows;"
+    cat "$ENODEJS_LIST"
+   fi
+  else
+   echo "could not find service to update"
+   return 1
+  fi
+ fi
+
+ if [ "$command" != "update" ]; then
+  echo "successfully ${mode}ed. enodejs service list is as follows;"
+  cat "$ENODEJS_LIST"
+ fi
+
+ return 0
+}
+
+system_daemon() {
+ local mode="$1"
+ local systemd_file="/lib/systemd/system/enodejs.service"
+ if [ ! -f "$systemd_file" ]; then
+cat << EOF > "$systemd_file"
+[Unit]
+Description=Ellucy nodejs startup
+DefaultDependencies=no
+
+Wants=nginx.service
+After=local-fs.target network.target nginx.service
+
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+ExecStart=/usr/local/sbin/enodejs boot
+ExecReload=/usr/local/sbin/enodejs reload
+ExecStop=/usr/local/sbin/enodejs shutdown
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 644 "$systemd_file"
+  systemctl daemon-reload
+ fi
+
+ if [ "$mode" = "enable" ]; then
+  systemctl enable enodejs.service >/dev/null 2>&1
+  echo "enodejs enabled at boot"
+ else
+  systemctl disable enodejs.service >/dev/null 2>&1
+  echo "enodejs disabled at boot"
+ fi
+
+ return 0
+}
+
+etest() {
+ ${pm2_exec} save --force
+ return 0
+ #echo "hey"
+ ${pm2_exec} show eagent | grep -m1 "script path" | sed 's/│/|/g' | cut -d"|" -f3 | xargs
+ return 0
+ local services=$(cat "$ENODEJS_LIST" 2>/dev/null | grep -v "^\s*[#;]" | grep -v "^[[:space:]]*$")
+ echo "$services"
+ return 0
+ [ -z "$services" ] && return 1
+}
+
+init || exit 1;
+case "$command" in
+ add)
+  service add "${@:2}"
+  ;;
+ remove)
+  service remove "${@:2}"
+  ;;
+ update)
+  service update "${@:2}"
+  ;;
+ start)
+  start start "${@:2}"
+  ;;
+ reload)
+  start reload "${@:2}"
+  ;;
+ sync)
+  start sync "${@:2}"
+  ;;  
+ stop)
+  stop stop "${@:2}"
+  ;;
+ reset)
+  stop delete "${@:2}"
+  ;;
+ enable)
+  system_daemon enable
+  ;;
+ disable)
+  system_daemon disable
+  ;;
+ status)
+  status
+  ;;
+ boot)
+  start boot
+  ;;
+ shutdown)
+  stop kill
+  ;;
+ etest)
+  etest "${@:2}"
+  ;;
+ *)
+  if echo "$command" | egrep -q "^(show|list|save|resurrect|restart|describe|kill)$"; then
+   ${pm2_exec} ${command} "${@:2}"
+   echo "$command_notice"
+  elif echo "$command" | egrep -q "^(jlist|prettylist|env|save|dump|logs|flush|reloadLogs|monit)$"; then
+   ${pm2_exec} ${command} "${@:2}"
+  else
+   echo "Error: Command not found. (usage: enodejs start|reload|stop|reset|sync|enable|disable|status|check|services)"
+   exit 1
+  fi
+esac
+
+exit 0

@@ -1,0 +1,51 @@
+var http = require('http');
+function handler(req, res) {
+ res.writeHead(200, {'Content-Type': 'text/plain'});
+ res.end('Hello Worldn');
+};
+http.createServer(handler).listen(1163, '127.0.0.1');
+http.createServer(handler).listen(1163, '192.168.0.100');
+
+
+/*
+//var express = require('express')
+var http = require('http');
+
+var server = http.createServer(function (req, res) {
+ res.writeHead(200, {'Content-Type': 'text/plain'});
+ res.end('Hello World\n');
+});
+
+server.on('connection', function (sock) {
+ console.log(sock.remoteAddress);
+ // Put your logic for what to do next based on that remote address here
+});
+
+server.listen(1163);
+*/
+
+
+https://velog.io/@peration/Node.js-pm2-%EC%84%A4%EC%B9%98-%EB%B0%8F-%EC%82%AC%EC%9A%A9%EB%B2%95
+https://medium.com/withj-kr/nodejs-express%EB%A1%9C-%EC%84%9C%EB%B2%84-%EA%B5%AC%EC%84%B1%ED%95%98%EA%B8%B0-1-express-%EA%B8%B0%EB%B3%B8%EA%B8%B0-c0245b4120bc
+https://developer.mozilla.org/ko/docs/Learn/Server-side/Express_Nodejs/Introduction
+https://www.npmjs.com/package/express-ip-access-control
+https://any-ting.tistory.com/74
+https://medium.com/stackfame/how-to-run-shell-script-file-or-command-using-nodejs-b9f2455cb6b7
+https://jsonobject.tistory.com/293
+http://i5on9i.blogspot.com/2020/12/nodejs-shell-command.html
+https://www.a-mean-blog.com/ko/blog/Node-JS-%EC%B2%AB%EA%B1%B8%EC%9D%8C/%EA%B2%8C%EC%8B%9C%ED%8C%90-%EB%A7%8C%EB%93%A4%EA%B8%B0/%EA%B2%8C%EC%8B%9C%ED%8C%90-Login-%EA%B8%B0%EB%8A%A5-%EC%B6%94%EA%B0%80
+https://devhints.io/pm2
+
+/*
+const express = require('express')
+const app = express()
+const port = 3000
+
+app.get('/', (req, res) => {
+  res.send('Hello World!')
+})
+
+app.listen(port, () => {
+  console.log(`Example app listening at http://localhost:${port}`)
+})
+*/

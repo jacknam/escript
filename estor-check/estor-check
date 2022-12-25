@@ -1,0 +1,1023 @@
+#!/bin/bash
+#
+# developed by jacknam@ellucy.com
+#
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin:/usr/local/sbin
+command="$1"
+VERSION=0.1
+CHECK_PATH="/opt/ellucy/estor/check"
+REPORT_PATH="${CHECK_PATH}/report"
+TASK_MARK="${CHECK_PATH}/.taskmark"
+LAZY_MARK="${CHECK_PATH}/.lazymark"
+DEVICE_MAP="${CHECK_PATH}/.devicemap"
+ROTATE_MAP="${CHECK_PATH}/.rotatemap"
+LOG_FILE="${CHECK_PATH}/check.log"
+CONF_FILE="${CHECK_PATH}/check.conf"
+STORCLI=
+
+exists() {
+ command -v "$1" >/dev/null 2>&1
+}
+
+external_ip() {
+ dig @1.1.1.1 ch txt whoami.cloudflare +short 2>/dev/null | sed 's/"//g'
+}
+
+logging() {
+ if [ -z "$1" ] || [ -z "$2" ]; then
+  return 1
+ fi
+
+ local target=""
+ case "$1" in
+ c)
+ target="OPERATION"
+ ;;
+ e)
+ target="ERROR"
+ ;;
+ rd)
+ target="RDISKCHECK"
+ ;;
+ r)
+ target="RAIDCHECK"
+ ;;
+ d)
+ target="DISKCHECK"
+ ;;
+ n)
+ target="NVMECHECK"
+ ;;
+ m)
+ target="MONITORING"
+ ;;
+ mr)
+ target="MRMONITOR"
+ ;;
+ *)
+  return 1
+ esac
+
+ local log="$(date '+%F %T') [$target] $2"
+ echo "$log" >> "$LOG_FILE"
+
+ local log_limit=5000
+ local log_count=$(wc -l < "$LOG_FILE" | xargs)
+ if [ "$log_count" -gt "$log_limit" ]; then
+  tail "-$(($log_limit / 2))" "$LOG_FILE" > "${LOG_FILE}.tmp"
+  mv "${LOG_FILE}.tmp" "$LOG_FILE"
+ fi
+
+ return 0
+}
+
+table_report() {
+ local in_d=$([ -z "$2" ] && echo "" || echo "-s '$2'")
+ local report=$(echo -e "$1" | column -t ${in_d})
+ [ -z "$report" ] && return 1
+
+ local under_bar=$(printf "\x2D%.0s" $(seq 1 $(echo "$report" | wc -L)))
+ local title=$(echo "$report" | head -1)
+ report=$(echo "$report" | sed '1d')
+
+ printf "%s\n%s\n%s\n%s\n%s\n" "$under_bar" "$title" "$under_bar" "$report" "$under_bar"
+
+ return 0
+}
+
+get_report() {
+ local target=$(echo "$1" | grep -oE "^(raid|rdisk|disk|nvme)$")
+ local report_file=""
+ if [ -z "$target" ]; then
+  report_file="${REPORT_PATH}/target_error.rpt"
+  rm -f "$report_file"
+ else
+  report_file="${REPORT_PATH}/${target}_check.rpt"
+ fi
+
+ echo "$report_file"
+ return 0
+}
+
+map_device() {
+ local d=()
+
+ local ctrl_cnt=$($STORCLI show ctrlcount 2>/dev/null | grep "Controller Count" | awk '{ print $NF; }' | grep -oE "^[1-9]+")
+ if [ -n "$ctrl_cnt" ]; then
+  d+=("raid")
+ fi
+
+ local m=$(smartctl --scan 2>/dev/null)
+ for t in megaraid scsi nvme; do
+  if echo "$m" | grep -q "\-d $t"; then
+   t=$(echo "$t" | sed 's/megaraid/rdisk/;s/scsi/disk/')
+   d+=("$t")
+  fi
+ done
+
+ echo "${d[@]}" | tr ' ' '\n' > "${DEVICE_MAP}"
+ return 0
+}
+
+set_mrmonitor() {
+ local action="$1"
+ local rsyslog_file="/etc/rsyslog.d/50-estor-check.conf"
+
+ if [ -z "$action" ]; then
+  if [ -f "$rsyslog_file" ]; then
+   echo "MR Monitor set in $rsyslog_file ($(logging mr file))"
+  else
+   echo "MR Monitor not set"
+  fi
+  return 0
+ elif [ "$action" = "remove" ]; then
+  if [ -f "$rsyslog_file" ]; then
+   rm -f "$rsyslog_file"
+   systemctl restart rsyslog
+  fi
+  return 0
+ elif [ "$action" != "set" ]; then
+  echo "command not found (set|remove)"
+  return 1
+ fi
+
+ local estor_check_exe=$(which estor-check 2>/dev/null)
+ if [ -z "$estor_check_exe" ]; then
+  echo "estor check is not registered as executable binary"
+  return 1
+ fi
+
+ if [ ! -f "$rsyslog_file" ]; then
+
+cat > "$rsyslog_file" <<EOF
+:msg,regex,"\<MRMON.*Controller ID:" ^${estor_check_exe}
+EOF
+
+  chmod 644 "$rsyslog_file"
+  systemctl restart rsyslog
+ fi
+
+ return 0
+}
+
+mr_monitor() {
+ local log=$(echo "$1" | sed -E 's/#[0-9]+//g' | xargs)
+
+ local action=""
+ if echo "$log" | grep -q "State change on VD:"; then
+  action="vd"
+ elif echo "$log" | grep -q "State change: PD"; then
+  action="pd"
+ elif echo "$log" | grep -q "Host driver is loaded"; then
+  action="load"
+ else
+  return 1
+ fi
+
+ local cid=$(echo "$log" | grep -oE "Controller ID: [0-9]+" | awk '{ print $NF; }')
+ [ -z "$cid" ] && return 1
+
+ local check=""
+ if [ "$action" = "load" ]; then
+  logging mr "(LOAD) CID $cid started"
+  check="Y"
+ else
+  local state=($(echo "$log" | grep -o "Previous =.*" | awk '{ if ($1=="Previous" && $4=="Current") print $3,$6; }'))
+  if [ "$action" = "vd" ]; then
+   if echo "${state[0]}" | grep -qE "(Optimal|Degraded|Offline)"; then
+    local vid=$(echo "$log" | grep -oE "VD: [0-9]+" | awk '{ print $NF; }')
+    logging mr "(VDCHANGE) CID $cid VID $vid state changed from '${state[0]}' to '${state[1]}'"
+    check="Y"
+   fi
+  else
+   if echo "${state[0]}" | grep -qE "(Online|Failed)"; then
+    local pid=$(echo "$log" | grep -o ": PD.*Previous" | sed 's/.*=//;s/Previous//' | xargs)
+    logging mr "(PDCHANGE) CID $cid PID $pid state changed from '${state[0]}' to '${state[1]}'"
+    check="Y"
+   fi
+  fi
+ fi
+
+ [ -z "$check" ] && return 0
+ mr_monitor_check &
+
+ return 0
+}
+
+mr_monitor_check() {
+ local wait_s=10
+ if [ -f "$LAZY_MARK" ]; then
+  local passed_s=$(expr $(date "+%s") - $(date -r "$LAZY_MARK" "+%s"))
+  if [[ "$passed_s" -lt "$wait_s" ]]; then
+   return 0
+  fi
+ fi
+ echo "$(date)" > "$LAZY_MARK"
+
+ sleep $wait_s
+
+ logging m "MR Monitor check started"
+ raid_regular_check init
+
+ return 0
+}
+
+estor_set_monitoring() {
+ if [ -z "$STORCLI" ]; then
+  logging e "No storcli64 installed"
+  return 1
+ fi
+
+ local ctrl_cnt=$($STORCLI show ctrlcount 2>/dev/null | grep "Controller Count" | awk '{ print $NF; }' | grep -oE "^[1-9]+")
+ if [ -z "$ctrl_cnt" ]; then
+  logging e "No raid controller found"
+  return 1
+ fi
+
+ local cids=$(seq 0 $(($ctrl_cnt-1)) | xargs)
+ for cid in ${cids}; do
+  if ! $STORCLI /c$cid show cc | grep -i "CC Operation Mode" | awk '{ print $NF; }' | grep -qi "disable"; then
+   $STORCLI /c$cid set cc=off > /dev/null 2>&1
+   logging c "Disabled consistencycheck of controller $cid"
+  fi
+  if ! $STORCLI /c$cid show pr | grep -i "PR Mode" | awk '{ print $NF; }' | grep -qi "disable"; then
+   $STORCLI /c$cid set pr=off /dev/null > /dev/null 2>&1
+   logging c "Disabled patrolread of controller $cid"
+  fi
+ done
+
+ return 0
+}
+
+estor_service() {
+ local action=$(echo "$1" | grep -oE "^(start|stop)$")
+ [ -z "$action" ] && return 1
+
+ if [ "$action" = "start" ]; then
+  logging c "ESTOR $(hostname) initialized"
+  map_device
+  check() {
+   raid_regular_check init
+   disk_regular_check disk init
+   disk_regular_check nvme init
+   reporting init
+  }
+  if [ "${@:$#}" = "b" ]; then
+   check &
+  else
+   check
+  fi
+ else
+  logging c "ESTOR $(hostname) shutdown"
+ fi
+
+ return 0
+}
+
+estor_set_init() {
+ local action=$(echo "$1" | grep -oE "^(set|remove)$")
+ [ -z "$action" ] && return 1
+
+ local reload=""
+ local srv_file="/etc/systemd/system/estor-check.service"
+
+ if [ "$action" = "set" ]; then
+  if [ -f "$srv_file" ]; then
+   if [ "${@:$#}" = "f" ]; then
+    reload="Y"
+   fi
+  else
+   reload="Y"
+  fi
+
+  if [ "$reload" = "Y" ]; then
+   local estor_check_exe=$(which estor-check 2>/dev/null)
+   if [ -z "$estor_check_exe" ]; then
+    echo "estor-check is not registered as executable binary"
+    return 1
+   fi
+
+cat > "$srv_file" <<EOF
+[Unit]
+Description=Ellucy ESTOR Check Service
+Before=shutdown.target
+Wants=network-online.target
+After=network.target network-online.target
+Requires=network.target
+
+[Service]
+Type=oneshot
+ExecStart=${estor_check_exe} service start b
+ExecStop=${estor_check_exe} service stop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+   chmod 664 "$srv_file"
+   systemctl enable estor-check.service
+   systemctl start estor-check.service
+  fi
+ else
+  if [ -f "$srv_file" ]; then
+   rm -f "$srv_file"
+   reload="Y"
+  fi
+ fi
+
+ if [ "$reload" = "Y" ]; then
+  systemctl daemon-reload
+ fi
+
+ return 0
+}
+
+estor_monitoring() {
+ [ ! -d "/etc/cron.d" ] && return 1
+
+ local mode="$1"
+ local cron_file="/etc/cron.d/estor-check"
+ if [ ! -f "$cron_file" ]; then
+  echo "# min hour dayofmonth month dayofweek user command" > "$cron_file"
+ fi
+
+ local msg=""
+ local status=$(cat "$cron_file" 2>/dev/null | grep "estor-check")
+ if [ "$mode" = "start" ]; then
+  local estor_check_exe=$(which estor-check 2>/dev/null)
+  if [ -z "$estor_check_exe" ]; then
+   echo "Failed to set monitoring"
+   return 1
+  fi
+  if [ -z "$status" ]; then
+   local interval_m=${CRON_INTERVAL_MIN:-30}
+   interval_m=$(echo $((interval_m<59 ? interval_m : 59)))
+   interval_m=$(echo $((interval_m>5 ? interval_m : 5)))
+   echo "*/${interval_m} * * * * root ${estor_check_exe} regularcheck" >> "$cron_file"
+   msg="has been activated"
+  else
+   msg="is already activated"
+  fi
+  set_mrmonitor set
+  estor_set_init set f
+  estor_set_monitoring
+ elif [ "$mode" = "stop" ]; then
+  if [ -z "$status" ]; then
+   msg="is not activated"
+  else
+   sed -i '/estor-check/d' "$cron_file"
+   msg="has been deactivated"
+  fi
+  set_mrmonitor remove
+  estor_set_init remove
+ else
+  if [ -z "$status" ]; then
+   msg="is not activated"
+  else
+   msg="is activated"
+  fi
+  msg+="\n> cron file: $cron_file"
+ fi
+
+ echo -e "ESTOR monitoring $msg"
+
+ return 0
+}
+
+estor_regular_check() {
+ [ "$REGULARCHECK_STOP" = "Y" ] && return 0
+ reporting
+
+ map_device
+ local d_m=$(cat "$DEVICE_MAP" 2>/dev/null) 
+ 
+ local now_s=$(date '+%s')
+ local interval_s=${TASK_INTERVAL_SEC:-60}
+ local passed_s=
+ 
+ local tasks="raid rdisk disk nvme"
+ for t in ${tasks}; do
+  if ! echo "$d_m" | grep -q "$t"; then
+   continue
+  fi
+  
+  if [ -f "$TASK_MARK" ]; then
+   t_s=$(date -r "$TASK_MARK" '+%s')
+   passed_s=$((now_s - t_s))
+   if [[ "$passed_s" -lt "$interval_s" ]]; then
+    return 0
+   fi
+  fi
+  
+  case "$t" in
+   raid)
+    raid_regular_check
+    ;;
+   rdisk)
+    rdisk_rotate_check
+    ;;
+   disk)
+    disk_regular_check disk
+    ;;
+   nvme)
+    disk_regular_check nvme
+    ;;
+  esac
+ done
+
+ return 0
+}
+
+next_did() {
+ local interval_s=$(echo "$1" | grep -oE "[0-9]+")
+ [ -z "$interval_s" ] && interval_s=3600
+
+ if [ ! -f "$ROTATE_MAP" ]; then
+  estor-disk raidmap > "$ROTATE_MAP"
+ fi
+
+ local r_m=$(cat "$ROTATE_MAP" 2>/dev/null)
+ [ -z "$r_m" ] && return 1
+
+ local t_s=$(date +%s)
+ local last=$(echo "$r_m" | tail -1)
+ local data=$(echo "$r_m" | grep -E "^[0-9]+ " | tr -s " " | cut -d" " -f1-5)
+
+ local target=""
+ if [ "${last:0:1}" = ">" ]; then
+  last=(${last:1})
+  if [ "$((t_s - interval_s))" -le "${last[0]}" ]; then
+   return 0
+  fi
+
+  target=$(echo "$data" | grep -A1 "^${last[1]} .* ${last[-1]}$")
+  if [ -z "$target" ]; then
+   rm -f "$ROTATE_MAP"
+   echo "$(next_did $interval_s)"
+   return 0
+  fi
+
+  if [ "$(echo "$target" | wc -l)" = "2" ]; then
+   target=$(echo "$target" | tail -1)
+  else
+   target=""
+  fi
+
+  r_m=$(echo "$r_m" | sed '$ d')
+ fi
+
+ if [ -z "$target" ]; then
+  target=$(echo "$data" | head -1)
+ fi
+
+ #local did=$(echo "$target" | rev | cut -d'.' -f1 | rev | grep -oE "[0-9]+")
+ local did=$(echo "${target##* }" | grep -oE "[0-9]+")
+ [ -z "$did" ] && return 1
+
+ echo -e "$r_m\n>${t_s} ${target}" > "$ROTATE_MAP"
+ echo "$did"
+
+ return 0
+}
+
+rdisk_rotate_check() {
+ local target=$(echo "$1" | grep -o "^full$")
+ local action=$(echo "${@:$#}" | grep -oE "^(init|show)$")
+ local report_file=$(get_report rdisk)
+
+ local target_did=""
+ if [ "$target" = "full" ]; then
+  target_did="all"
+  local last_ts=0
+  if [ "$action" != "show" ]; then
+   last_ts=$(date -r "$report_file" "+%s" 2>/dev/null)
+   if [ -z "$last_ts" ]; then
+    last_ts=0
+   else
+    if [ -z "$(cat "$report_file" 2>/dev/null)" ]; then
+     last_ts=0
+    fi
+   fi
+  fi
+  if [ "$last_ts" -gt "0" ]; then
+   local interval_s=0
+   if [ "$action" = "init" ]; then
+    interval_s=${TASK_INTERVAL_SEC:-60}
+   else
+    local interval_h=${RDISKCHECK_INTERVAL:-24}
+    interval_s=$(expr $interval_h \* 60 \* 60)
+   fi
+   local passed_s=$(expr $(date "+%s") - $last_ts)
+   if [ "$passed_s" -le "$interval_s" ]; then
+    target_did=""
+   fi
+  fi
+ else
+  local interval_s=0
+  if [ -z "$action" ]; then
+   local interval_h=${ROTATECHECK_INTERVAL:-3}
+   interval_s=$(expr $interval_h \* 60 \* 60)
+  elif [ "$action" = "init" ]; then
+   interval_s=${TASK_INTERVAL_SEC:-60}
+  fi
+  target_did=$(next_did ${interval_s})
+ fi
+ [ -z "$target_did" ] && return 0
+
+ local check=$(estor-disk raiddiskcheck "$target_did" "raw" q)
+ #local check="47|Hitachi|HDS722020ALA330|JK11A8B9J3NBBF|2.00TB|512|HDD|7200|SATA|35|73557|0|90|PASS|0|0|0|0|BAD"
+ echo "$(date)" > "$TASK_MARK"
+ if [ -z "$check" ]; then
+  if [ -f "$report_file" ]; then
+   if [ "$target_did" = "all" ]; then
+    rm -f "$report_file"
+   else
+    sed -i "/^${target_did}|/d" "$report_file"
+   fi
+  fi
+  touch "$report_file"
+  rm -f "$ROTATE_MAP"
+  return 1
+ fi
+
+ local health=$(echo "$check" | grep -q "|BAD$" && echo "BAD" || echo "GOOD")
+ check=$(echo "$check" | awk -v ts="$(date +%s)" 'BEGIN {FS="|";OFS="|";} { print $0,ts; }')
+
+ local report=$([ "$target_did" = "all" ] && echo "" || cat "${report_file}" 2>/dev/null)
+ if [ -z "$report" ]; then
+  report="$(estor-disk raiddiskcheck header)|TIMESTAMP\n${check}"
+ else
+  report=$(echo "$report" | grep -v "^${target_did}|")"\n${check}"
+ fi
+ report=$(echo -e "$report" | grep -v "^$")
+ echo "$report" > "${report_file}"
+
+ local action_kind="Rotate Check"
+ if [ "$action" = "show" ]; then
+  action_kind="Manual Check"
+  check_report rdisk
+ elif [ "$action" = "init" ]; then
+  action_kind="Init Check"
+ fi
+ logging rd "DID #${target_did} ${action_kind} : ${health}"
+
+ if [ "$health" != "GOOD" ]; then
+  [ "$action" != "show" ] && reporting_bad rdisk
+ fi
+
+ return 0
+}
+
+raid_regular_check() {
+ local action=$(echo "${@:$#}" | grep -oE "^(init|show)$")
+ local report_file=$(get_report raid)
+
+ local last_ts=0
+ if [ "$action" != "show" ]; then
+  last_ts=$(date -r "$report_file" "+%s" 2>/dev/null)
+  if [ -z "$last_ts" ]; then
+   last_ts=0
+  else
+   if [ -z "$(cat "$report_file" 2>/dev/null)" ]; then
+    last_ts=0
+   fi
+  fi
+ fi
+
+ if [ "$last_ts" -gt "0" ]; then
+  local interval_s=0
+  if [ "$action" = "init" ]; then
+   interval_s=${TASK_INTERVAL_SEC:-60}
+  else
+   local interval_h=${RAIDCHECK_INTERVAL:-6}
+   interval_s=$(expr $interval_h \* 60 \* 60)
+  fi
+
+  local passed_s=$(expr $(date "+%s") - $last_ts)
+  if [ "$passed_s" -le "$interval_s" ]; then
+   return 0
+  fi
+ fi
+
+ local check=$(estor-disk raidstat raw)
+ echo "$(date)" > "$TASK_MARK"
+ if [ -z "$check" ]; then
+  echo "" > "$report_file"
+  #touch "$report_file"
+  return 1
+ fi
+
+ local health=$(echo "$check" | grep -m1 "^> RAID Status:" | cut -d":" -f2 | xargs)
+ local report=$(echo -e "${check}\n> CHECK DATETIME: $(date '+%Y-%m-%d %H:%M:%S')")
+ echo "$report" > "$report_file"
+
+ local action_kind="Regular Check"
+ if [ "$action" = "show" ]; then
+  action_kind="Manual Check"
+  check_report raid
+ elif [ "$action" = "init" ]; then
+  action_kind="Init Check"
+ fi
+ logging r "${action_kind} : ${health}"
+
+ if [ "$health" = "Error" ]; then
+  [ "$action" != "show" ] && reporting_bad raid
+ fi
+
+ return 0
+}
+
+disk_regular_check() {
+ local target=$(echo "$1" | grep -oE "^(disk|nvme)$")
+ [ -z "$target" ] && return 1
+
+ local action=$(echo "${@:$#}" | grep -oE "^(init|show)$")
+ local report_file=$(get_report ${target})
+
+ local last_ts=0
+ if [ "$action" != "show" ]; then
+  last_ts=$(date -r "$report_file" "+%s" 2>/dev/null)
+  if [ -z "$last_ts" ]; then
+   last_ts=0
+  else
+   if [ -z "$(cat "$report_file" 2>/dev/null)" ]; then
+    last_ts=0
+   fi
+  fi
+ fi
+
+ if [ "$last_ts" -gt "0" ]; then
+  local interval_s=0
+  if [ "$action" = "init" ]; then
+   interval_s=${TASK_INTERVAL_SEC:-60}
+  else
+   local interval_h=0
+   if [ "$target" = "disk" ]; then
+    interval_h=${DISKCHECK_INTERVAL:-12}
+   else
+    interval_h=${NVMECHECK_INTERVAL:-8}
+   fi
+   interval_s=$(expr $interval_h \* 60 \* 60)
+  fi
+
+  local passed_s=$(expr $(date "+%s") - $last_ts)
+  if [ "$passed_s" -le "$interval_s" ]; then
+   return 0
+  fi
+ fi
+
+ local check=$(estor-disk ${target}check raw q)
+ echo "$(date)" > "$TASK_MARK"
+ if [ -z "$check" ]; then
+  echo "" > "$report_file"
+  #touch "$report_file"
+  return 1
+ fi
+
+ local health=$(echo "$check" | grep -q "|BAD$" && echo "BAD" || echo "GOOD")
+ check=$(echo "$check" | awk -v ts="$(date +%s)" 'BEGIN {FS="|";OFS="|";} { print $0,ts; }')
+
+ local report=$(echo -e "$(estor-disk ${target}check header)|TIMESTAMP\n${check}" | grep -v "^$")
+ echo "$report" > "$report_file"
+
+ local action_kind="Regular Check"
+ if [ "$action" = "show" ]; then
+  action_kind="Manual Check"
+  echo "> ${target^^} Report"
+  check_report ${target}
+ elif [ "$action" = "init" ]; then
+  action_kind="Init Check"
+ fi
+ logging ${target:0:1} "${action_kind} : ${health}"
+
+ if [ "$health" != "GOOD" ]; then
+  [ "$action" != "show" ] && reporting_bad ${target}
+ fi
+
+ return 0
+}
+
+check_report() {
+ local target=$(echo "$1" | grep -oE "^(raid|rdisk|disk|nvme)$")
+ [ -z "$target" ] && return 1
+
+ local report_file=$(get_report ${target})
+ local report=""
+ local header=""
+ if [ "$target" = "raid" ]; then
+  report=$(cat "$report_file" 2>/dev/null)
+  [ -z "$report" ] && return 1
+
+  if [ "$2" = "bad" ]; then
+   if echo "$report" | grep -q "Status: Optimal"; then
+    return 0
+   fi
+  fi
+
+  local titles=$(echo "$report" | grep "^>")
+  local datas=()
+  while read -r line; do
+   if [ "$2" != "full" ]; then
+    if ! echo "$line" | grep -qE "^> (RAID State|Error)"; then
+     continue
+    fi
+   fi
+   data=$(echo "$report" | sed -n "/${line}/,/>/ p" | grep -v "^>")
+   datas+=("$line" "$data")
+  done <<< "$(echo "$titles" | grep -v ":")"
+
+  titles=$(echo "$titles" | grep ":")
+  echo "$titles" | head -1
+  for (( i=0; i<${#datas[@]}; i++ )); do
+   if [ $((i%2)) == 0 ]; then
+    echo "${datas[i]}"
+   else
+    table_report "${datas[i]}" "|"
+   fi
+  done
+  echo "$titles" | tail -1
+
+  return 0
+ fi
+
+ if [ "$target" = "rdisk" ]; then
+  local dids=$(smartctl --scan | grep "\-d megaraid," | awk '{ split($3,a,","); print a[2]; }')
+  while read -r line; do
+   did=$(echo "$line" | cut -d"|" -f1 | xargs)
+   if echo "$dids" | grep -q "^${did}$"; then
+    report+="\n${line}"
+   fi
+  done <<< "$(cat "$report_file" 2>/dev/null | grep -E "^[0-9]+\|")"
+  report=$(echo -e "$report" | grep -v "^$")
+  header=$(estor-disk raiddiskcheck header)
+ elif [ "$target" = "disk" ]; then
+  report=$(cat "$report_file" 2>/dev/null | grep "^/dev/.*|")
+  header=$(estor-disk diskcheck header)
+ else
+  report=$(cat "$report_file" 2>/dev/null | grep "^/dev/.*|")
+  header=$(estor-disk nvmecheck header)
+ fi
+
+ if [ "$2" = "bad" ]; then
+  report=$(echo "$report" | grep "|BAD|")
+ fi
+ [ -z "$report" ] && return 1
+
+ report=$(echo "$report" | awk 'BEGIN {FS="|";OFS="|";} {$NF=strftime("%Y-%m-%d %H:%M:%S",$NF);print NR,$0;}')
+ report=$(echo -e "NO|${header}|CHECK DATETIME\n${report}")
+
+ if [ "$2" = "bad" ]; then
+  if [ "$target" != "nvme" ]; then
+   report=$(echo "$report" | cut -d"|" -f1-3,5,11-21)
+  fi
+ fi
+ table_report "${report}" "|"
+
+ return 0
+}
+
+json_report() {
+ cat "$(get_report raid)"
+}
+
+reporting_bad() {
+ if [ "${ERROR_REPORTING^^}" != "Y" ] || [ -z "$REPORTING_EMAIL" ]; then
+  return 0
+ fi
+
+ if ! exists msmtp; then
+  logging e "No mail app found"
+  return 1
+ fi
+
+ local target=$(echo "$1" | grep -oE "^(raid|rdisk|disk|nvme)$")
+ [ -z "$target" ] && return 1
+
+ local report=$(check_report ${target} bad)
+ [ -z "$report" ] && return 0
+
+ local host_name=$(hostname)
+ local ip=$(external_ip)
+ target=${target^^}
+ report=$(echo -e "CAUTIONS! ${target} is not HEALTHY\n\n1. Host: ${host_name}\n2. IP: ${ip}\n3. Bad Target: ${target}\n\n${report}\n")
+
+ local result=$(echo -e "Subject: ESTOR [${host_name}] ${target} Error Report\n${report}" | msmtp -a default "$REPORTING_EMAIL")
+ if [ -n "$result" ]; then
+  logging e "Could not send the error report to $REPORTING_EMAIL"
+  return 1
+ fi
+
+ return 0
+}
+
+reporting() {
+ local interval_d=$(echo $REPORTING_INTERVAL_DAY | grep -oE "[0-9]+")
+ if [ -z "$interval_d" ] || [ -z "$REPORTING_EMAIL" ]; then
+  return 0
+ fi
+
+ local action_type=""
+ if [ "$1" = "init" ]; then
+  action_type="Init"
+ else
+  action_type="Regular"
+  local REPORTING_MARK="${CHECK_PATH}/.reporting"
+  if [ -f "$REPORTING_MARK" ]; then
+   if [ "$(expr $(date "+%s") - $(date -r "$REPORTING_MARK" "+%s"))" -lt "$(expr $interval_d \* 86400)" ]; then
+    return 0
+   fi
+  fi
+  echo "$(date)" > "$REPORTING_MARK"
+ fi
+
+ if ! exists msmtp; then
+  logging e "No mail app found"
+  return 1
+ fi
+
+ local report=$(status_report)
+ [ -z "$report" ] && return 1
+
+ local health=$(echo "$report" | grep -qE "(BAD|Error)" && echo "BAD" || echo "GOOD")
+ local host_name=$(hostname)
+ local ip=$(external_ip)
+ report=$(echo -e "# ${action_type} Status Report\n\n1. Host: ${host_name}\n2. IP: ${ip}\n3. Health: ${health}\n\n${report}\n")
+
+ local result=$(echo -e "Subject: ESTOR [$(hostname)] ${action_type} Status Report\n${report}" | msmtp -a default "$REPORTING_EMAIL")
+ if [ -n "$result" ]; then
+  logging e "Could not send the report to $REPORTING_EMAIL"
+  return 1
+ fi
+
+ return 0
+}
+
+status_report() {
+ local target="$1"
+ local reports="raid rdisk disk nvme"
+ local i=0
+ for r in ${reports}; do
+  let "i+=1"
+  t="${r^^}"
+  report=$(check_report ${r} ${target})
+  if [ -z "$report" ]; then
+   report=$(echo "- No ${target} ${t} found" | tr -s " ")
+  fi
+  echo "${i}. ${t} Report"
+  echo -e "${report}\n"
+ done
+
+ return 0
+}
+
+set_conf() {
+ local key="${1^^}"
+ local val="$2"
+ if [ -z "$key" ] || [ -z "$val" ]; then
+  cat "$CONF_FILE" 2>/dev/null
+  return 0
+ fi
+
+ local conf=$(cat "$CONF_FILE" 2>/dev/null | sed "/^${key}=/d")
+ if [ "$val" != "del" ]; then
+  if echo "$val" | grep -qE "^[0-9]+"; then
+   conf="${conf}\n${key}=${val}"
+  else
+   conf="${conf}\n${key}=\"${val}\""
+  fi
+ fi
+
+ echo -e "$conf" | tee "$CONF_FILE"
+
+ return 0
+}
+
+help() {
+echo "Ellucy ESTOR Check $VERSION
+Copyright: Jack Nam (jacknam@ellucy.com)
+
+Required:
+estor-disk, storcli
+
+Reference:
+Report Path   : $REPORT_PATH
+Config File   : $CONF_FILE
+Log File      : $LOG_FILE
+Systemd File  : /etc/systemd/system/estor-check.service
+Rsyslog File  : /etc/rsyslog.d/50-estor-check.conf
+Check Devices : $(cat $DEVICE_MAP | xargs)
+
+* $(estor_monitoring)
+
+Configs:
+$(cat $CONF_FILE)
+
+Commands:
+status (bad)                       show full or bad status report of disks
+raidcheck                          analyze and report raid healty
+diskcheck                          analyze and report disk healty
+rdiskcheck                         analyze and report raid disk by rotate order
+rdiskfullcheck                     analyze and report all raid disks
+reporting                          send a full status report to email recipient
+checkreport (raid|rdisk|disk|nvme) show status report by the specific target
+monitoring (start|stop)            activate or deactivate ESTOR monitoring using regularcheck
+set (none|key) (val|del)           set config 'key=val' to Config (if del, then remove)
+help                               help usage
+"
+
+ return 0
+}
+
+init() {
+ if ! exists estor-disk; then
+  echo "estor-disk not installed"
+  return 1
+ fi
+
+ STORCLI=$(which storcli64 2>/dev/null)
+
+ if [ ! -d "$CHECK_PATH" ]; then
+  mkdir -p "$CHECK_PATH"
+ fi
+
+ if [ ! -d "$REPORT_PATH" ]; then
+  mkdir -p "$REPORT_PATH"
+ fi
+
+ if [ ! -f "$CONF_FILE" ]; then
+cat > "$CONF_FILE" <<EOF
+TASK_INTERVAL_SEC=60
+CRON_INTERVAL_MIN=30
+ROTATECHECK_INTERVAL=3
+RAIDCHECK_INTERVAL=6
+NVMECHECK_INTERVAL=8
+DISKCHECK_INTERVAL=12
+RDISKCHECK_INTERVAL=24
+REPORTING_INTERVAL_DAY=7
+ERROR_REPORTING=""
+REPORTING_EMAIL=""
+REGULARCHECK_STOP=""
+EOF
+ fi
+
+ source "$CONF_FILE"
+
+ if [ ! -f "$DEVICE_MAP" ]; then
+  map_device
+ fi
+
+ return 0
+}
+
+if ! init; then
+ exit 1
+fi
+
+case "$command" in
+ checkreport)
+  check_report "${@:2}"
+  ;;
+ raidcheck)
+  raid_regular_check show
+  ;;
+ diskcheck)
+  disk_regular_check disk show
+  disk_regular_check nvme show
+  ;;
+ rdiskcheck)
+  rdisk_rotate_check show
+  ;;
+ rdiskfullcheck)
+  rdisk_rotate_check full show
+  ;;
+ regularcheck)
+  estor_regular_check
+  ;;
+ monitoring)
+  estor_monitoring "${@:2}"
+  ;;
+ service)
+  estor_service "${@:2}"
+  ;;
+ status)
+  status_report "${@:2}"
+  ;;
+ reporting)
+  reporting "${@:2}"
+  ;;
+ set)
+  set_conf "${@:2}"
+  ;;
+ help)
+  help
+  ;;
+ *)
+  if echo "$command" | grep -q "MRMON"; then
+   mr_monitor "$command"
+  else
+   echo "Ellucy ESTOR Check $VERSION"
+  fi
+esac
+
+exit 0

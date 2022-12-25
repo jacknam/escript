@@ -1,0 +1,1463 @@
+#!/bin/bash
+#
+# developed by jacknam@ellucy.com
+#
+VERSION=1.0
+EBACKUP_PATH="/etc/ebackup"
+EBACKUP_PRESET_PATH="$EBACKUP_PATH/preset"
+EBACKUP_KEY_PATH="$EBACKUP_PATH/ssh_key"
+EBACKUP_CONFIG="${EBACKUP_PATH}/ebackup.conf"
+EBACKUP_LOG="${EBACKUP_PATH}/ebackup.log"
+EBACKUP_BIG_VAR=""
+command="$1"
+
+exists() {
+ command -v "$1" >/dev/null 2>&1
+}
+
+check_internet() {
+ if ip route 2>/dev/null | grep -q default; then
+  nc -zw1 1.1.1.1 53 >/dev/null 2>&1 && return 0
+ fi
+ return 1
+}
+
+ssh_key_copy() {
+ local client_host="$1"
+ local client_port="$2"
+ local client_id="$3"
+
+ if [ -z "$client_host" ] || [ -z "$client_port" ] || [ -z "$client_id" ]; then
+  return 1
+ fi
+
+ if [ ! -d "$EBACKUP_KEY_PATH" ]; then
+  mkdir -p "$EBACKUP_KEY_PATH"
+ fi
+
+ if [ ! -f "/root/.ssh/id_rsa" ]; then
+  ssh-keygen -t rsa -b 2048
+ fi
+
+ local ssh_key_path="${EBACKUP_KEY_PATH}/${client_id}@${client_host}:${client_port}"
+ if [ ! -d "$ssh_key_path" ]; then
+  read -t 5 -rp "> Would you like to copy ssh key to ${client_host}? (y|N) : " answer < /dev/tty
+  [ -z "$answer" ] && echo ""
+  [ "$(echo "$answer" | awk '{ print tolower($0); }')" != "y" ] && return 1
+  if ssh-copy-id "${client_id}@${client_host}" -p "${client_port}"; then
+   mkdir "$ssh_key_path"
+  else
+   return 1
+  fi
+ fi
+
+ return 0
+}
+
+make_sudo_rsync() {
+ local client_host="$1"
+ local client_port="$2"
+ local client_id="$3"
+ if [ -z "$client_host" ] || [ -z "$client_id" ] || [ -z "$client_port" ]; then
+  return 1
+ fi
+
+ local ssh_key_path="${EBACKUP_KEY_PATH}/${client_id}@${client_host}:${client_port}"
+ [ ! -d "$ssh_key_path" ] && return 1
+
+ local sudo_rsync_name="sudo_rsync_${client_id}"
+ local sudo_rsync_file="${ssh_key_path}/${sudo_rsync_name}"
+ if [ ! -f "$sudo_rsync_file" ]; then
+  echo "${client_id} ALL=NOPASSWD:/usr/bin/rsync" > "$sudo_rsync_file"
+  chmod 0440 "$sudo_rsync_file"
+
+  local remote_file="/home/${client_id}/${sudo_rsync_name}"
+  if rsync -a -e "ssh -p ${client_port} -o ConnectTimeout=5" --timeout=10 --delete --rsync-path="rsync" "$sudo_rsync_file" "${client_id}@${client_host}:${remote_file}"; then
+   if ssh -t -o ConnectTimeout=2 -p "${client_port}" "${client_id}@${client_host}" "sudo mv -f ${remote_file} /etc/sudoers.d/ && sudo chown root:root /etc/sudoers.d/${sudo_rsync_name}"; then
+    return 0
+   fi
+  fi
+
+  rm -f "$sudo_rsync_file"
+  return 1
+ fi
+
+ return 0
+}
+
+validate_ip() {
+ local ip="$1"
+ [ -z "$ip" ] && return 1
+
+ if echo "$ip" | grep -q "[a-zA-Z]"; then
+  if ! exists dig; then
+   if [ -f "/etc/apt/sources.list" ]; then
+    apt-get -qq update && apt-get install -y -q dnsutils
+   elif [ -d "/etc/yum.repos.d" ]; then
+    yum -y -q update && yum -y -q install bind-utils
+   fi
+  fi
+  ip=$(dig +short "$ip" 2>/dev/null)
+ fi
+
+ ip=$(echo "$ip" | grep -oE "[1-9]{1}[0-9]{0,2}\.([0-9]{1,3}\.){2}[1-9%]{1}[0-9]{0,2}")
+ echo "$ip" | xargs
+ return 0
+}
+
+validate_port() {
+ local port="$1"
+ [ -z "$port" ] && return 1
+
+ port=$(echo "$port" | egrep "^[0-9]{1,5}$")
+ echo "$port" | xargs
+ return 0
+}
+
+client_check() {
+ local client_host=$(validate_ip "$1")
+ local client_port=$(validate_port "$2")
+ local client_id="$3"
+ local client_path="$4"
+ local owner_check="$5"
+
+ if [ -z "$client_host" ] || [ -z "$client_port" ] || [ -z "$client_id" ]; then
+  return 1
+ fi
+
+ nc -zw1 ${client_host} ${client_port} >/dev/null 2>&1 || return 1
+
+ if ! ssh_key_copy "${client_host}" "${client_port}" "${client_id}"; then
+  echo "[ERROR] The ebackup requires ssh-copy-id for the remote ${action}"
+  return 1
+ fi
+
+ local check_value=""
+ if [ -z "$client_path" ]; then
+  check_value=$(timeout 3 bash -c "ssh -p ${client_port} ${client_id}@${client_host} 'echo hey' 2>/dev/null")
+  [ "$check_value" != "hey" ] && return 1
+ else
+  if echo "$client_path" | grep -q "^\/"; then
+   check_value=$(timeout 5 bash -c "ssh -p ${client_port} ${client_id}@${client_host} 'stat -c \"%U:%G\" ${client_path}' 2>/dev/null")
+  fi
+  [ -z "$check_value" ] && return 1
+  if [ "$owner_check" = "true" ]; then
+   echo "$check_value"
+  fi
+ fi
+
+ return 0
+}
+
+size_byte() {
+ local size=$(echo "$1" | grep -oE "^[0-9.]*")
+ local unit=$(echo "$1" | grep -oE "(K|M|G)$")
+ if [ "$unit" = "K" ]; then
+  awk "BEGIN {printf \"%d\n\", $size*1024}"
+ elif [ "$unit" = "M" ]; then
+  awk "BEGIN {printf \"%d\n\", $size*1024*1024}"
+ elif [ "$unit" = "G" ]; then
+  awk "BEGIN {printf \"%d\n\", $size*1024*1024*1024}"
+ else
+  awk "BEGIN {printf \"%d\n\", $size}"
+ fi
+
+ return 0
+}
+
+get_rsyncinfo() {
+ local stat_data=$(echo "$1" | grep -E "^(Number of.*:|Total.*size:)")
+ [ -z "$stat_data" ] && return 1
+
+ IFS=$'\n'; stat_data=( ${stat_data} ); unset IFS
+ [ "${#stat_data[@]}" != "6" ] && return 1
+
+ local action=$(echo ${2^})
+ echo "[${action} Target Stat]"
+ echo "${stat_data[4]}"
+ echo "${stat_data[0]}"
+ echo "[${action} Transfer Detail]"
+ echo "${stat_data[5]}"
+ echo "${stat_data[3]}"
+ echo "${stat_data[1]}"
+ echo "${stat_data[2]}"
+
+ local human_size=""
+ local human_count=""
+ local approx_time=""
+ local value=""
+ local rsync_brief="[rsync_brief]"
+ for i in 0 4 3 5; do
+  value=$(echo "${stat_data[$i]}" | cut -d":" -f2 | awk '{ print $1; }')
+  [ "$i" = "3" ] && human_count="$value"
+  [ "$i" = "5" ] && human_size="$value"
+  value=$(size_byte "$value")
+  [ "$i" = "5" ] && approx_time="$value"
+  rsync_brief+=" ${value}"
+ done
+ rsync_brief+=" ${human_count}"
+ rsync_brief+=" ${human_size}"
+ approx_time=$(awk "BEGIN {printf \"%d\n\", ${approx_time}/31457280/60}")
+ rsync_brief+=" ${approx_time}"
+
+ # 0: total count, 1: total byte size, 2: transfer count, 3: transfer byte size, 4: transfer human count, 5: transfer human size, 6: approx. time (min)
+ echo "$rsync_brief"
+ return 0
+}
+
+get_detail() {
+ local conf_file="$1"
+ [ -z "$conf_file" ] && return 1
+
+ conf_file=$(echo "$conf_file" | cut -d":" -f2 | xargs)
+ [ ! -f "$conf_file" ] && return 1
+
+ local detail=""
+ IFS=$'\n'; for line in $(cat "$conf_file" | grep "^\["); do
+  if [ "${line:1:11}" = "target_host" ]; then
+   detail+=$(echo "$line" | cut -d"|" -f2)":"
+  else
+   detail+=$(echo "$line" | cut -d"|" -f1)
+  fi
+  detail+=" "
+ done; unset IFS
+ echo "$detail" | xargs
+
+ return 0
+}
+
+edit_target() {
+ local target="$1"
+ local option=""
+ local filter=""
+ local confirm=""
+
+ if [ -n "$target" ] && [ -f "${EBACKUP_PRESET_PATH}/${target}.conf" ]; then
+  nano "${EBACKUP_PRESET_PATH}/${target}.conf"
+  return 0
+ fi
+
+ echo -e "\nEllucy ebackup target edit\n"
+ local list=$(find "$EBACKUP_PRESET_PATH" -type f -name "*.conf" -printf '%f: %p\n' 2>/dev/null | sed "s/\.conf\:/ :/")
+ if [ -n "$list" ]; then
+  option="[number/(n)ew/(d)elete/(c)ancel]: "
+  filter="^([0-9]*|n|d|c)$"
+  confirm="> Please type a number of target to edit or command letter"
+  echo "* current target list"
+  local detail=""
+  local number=0
+  IFS=$'\n'; for line in ${list}; do
+   (( number++ ))
+   detail=$(get_detail "$line")
+   echo "[$number] $line : $detail"
+  done; unset IFS
+ else
+  option="[(n)ew/(c)ancel]: "
+  filter="^(n|c)$"
+  confirm="> Please create a new target"
+  echo "* there is no target"
+ fi
+
+ echo -n -e "\n$confirm $option"
+ local answer=""
+ while [ -z "$answer" ]; do
+  read answer < /dev/tty
+  answer=$(echo "$answer" | egrep "$filter")
+  if [ -z "$answer" ]; then
+   echo -n "> Please enter a valid option $option"
+  fi
+ done
+
+ local taget_file=""
+ if [ "$answer" = "c" ]; then
+  echo "> target editing has been cancelled"
+ elif [ "$answer" = "d" ]; then
+  option="[number/(c)ancel]: "
+  filter="^([0-9]*|c)$"
+  confirm="> Please type the number of target to delete"
+  echo -n "$confirm $option"
+  local deleting_target=""
+  answer=""
+  while [ -z "$answer" ]; do
+   read answer < /dev/tty
+   answer=$(echo "$answer" | egrep "$filter")
+   if [ "$answer" = "c" ]; then
+    deleting_target=""
+   else
+    if [ -z "$answer" ]; then
+     deleting_target=""
+    else
+     deleting_target=$(echo "$list" | sed -n "${answer}"p 2>/dev/null)
+    fi
+    if [ -z "$deleting_target" ]; then
+     echo -n "> Please enter a valid target number to delete $option"
+     answer=""
+    fi
+   fi
+  done
+  if [ -n "$deleting_target" ]; then
+   target=$(echo "$deleting_target" | cut -d":" -f1 | xargs)
+   option="[(y)es/(n)o]: "
+   filter="^(y|n)$"
+   confirm="> Are you sure to delete the target [${target}]? $option"
+   echo -n "$confirm $option"
+   answer=""
+   while [ -z "$answer" ]; do
+    read answer < /dev/tty
+    answer=$(echo "$answer" | egrep "$filter")
+    if [ -z "$answer" ]; then
+     echo -n "> Please enter a valid option $option"
+    fi
+   done
+   if [ "$answer" = "y" ]; then
+    rm -f "$(echo "$deleting_target" | cut -d":" -f2 | xargs)"
+    echo "> Successfully deleted the target [${target}]"
+   fi
+  fi
+ elif [ "$answer" = "n" ]; then
+  option="[target name/(c)ancel]: "
+  confirm="> Please type the name of target to create"
+  echo -n "$confirm $option"
+  answer=""
+  while [ -z "$answer" ]; do
+   read answer < /dev/tty
+   if [ "$answer" != "c" ] && [ ${#answer} -lt 5 ]; then
+     echo -n "> Please enter a valid target name to create (min 5 length) $option"
+     answer=""
+   fi
+  done
+  if [ "$answer" != "c" ]; then
+   local create_target="${EBACKUP_PRESET_PATH}/${answer}.conf"
+   if [ ! -f "$create_target" ]; then
+cat > "$create_target" <<EOF
+#[target_host]|host_addr|host_sshport|host_id
+#[target_section]|owner_uid|permission_rwx
+#target_path|exclude|sudo_action|ransom_check|make_history
+EOF
+   fi
+   nano "$create_target"
+   echo "> the target [${answer}] has been created at ${create_target}"
+  fi
+ else
+  answer=$(echo "$answer" | egrep "^([0-9]*)$")
+  local editing_target=$(echo "$list" | sed -n "${answer}"p 2>/dev/null)
+  if [ -z "$editing_target" ]; then
+   option="[number/(c)ancel]: "
+   filter="^([0-9]*|c)$"
+   confirm="> Please type the number of target to edit"
+   echo -n "$confirm $option"
+   answer=""
+   while [ -z "$answer" ]; do
+    read answer < /dev/tty
+    answer=$(echo "$answer" | egrep "$filter")
+    if [ "$answer" = "c" ]; then
+     editing_target=""
+    else
+     if [ -z "$answer" ]; then
+      editing_target=""
+     else
+      editing_target=$(echo "$list" | sed -n "${answer}"p 2>/dev/null)
+     fi
+     if [ -z "$editing_target" ]; then
+      echo -n "> Please enter a valid target number to edit $option"
+      answer=""
+     fi
+    fi
+   done
+  fi
+  if [ -n "$editing_target" ]; then
+   target=$(echo "$editing_target" | cut -d":" -f1 | xargs)
+   option="[(y)es/(n)o]: "
+   confirm="> Would you like to edit the target [${target}]?"
+   echo -n "$confirm $option"
+   read answer < /dev/tty
+   if [ "$answer" = "y" ]; then
+    nano "$(echo "$editing_target" | cut -d":" -f2 | xargs)"
+    echo "> the target [${target}] editing has been done"
+   fi
+  fi
+ fi
+
+ echo ""
+ return 0
+}
+
+ebackup_all() {
+ local opt=""
+ if [ -n "$*" ]; then
+  for v in "${@}"; do
+   if [ "${v:0:1}" = "-" ]; then
+    if [ "${v:1:1}" = "-" ]; then
+     opt+="|${v}|"
+    else
+     if [ "${#v}" -gt "2" ]; then
+      for i in $(seq 1 $((${#v}-1))); do
+       opt+="|${v:i:1}|"
+      done
+     else
+      opt+="|${v}|"
+     fi
+    fi
+   fi
+  done
+ fi
+ opt=$(echo "$opt" | sed "s/\-//g")
+
+ local presets=$(find "$EBACKUP_PRESET_PATH" -maxdepth 1 -mindepth 1 -type f -name *.conf -printf '%P\n' | sed "s/\.conf$//")
+ if [ -z "$presets" ]; then
+  echo "[ERROR] No preset defined yet"
+  return 1
+ fi
+
+ local quiet_mode=""
+ local background_mode=""
+ if echo "$opt" | grep -q "|b|"; then
+  background_mode="true"
+ else
+  if echo "$opt" | grep -q "|q|"; then
+   quiet_mode="true"
+  else
+   local answer=""
+   echo -e "> Target List\n$presets"
+   read -t 10 -rp "> Would you like to backup all the targets (it might take so long time)? (y|N) : " answer < /dev/tty
+   answer=$(echo "$answer" | awk '{ print tolower($0); }')
+   [ -z "$answer" ] && echo ""
+   if [ "$answer" != "y" ]; then
+    echo "> the backup for all targets has been cancelled"
+    return 0
+   fi
+  fi
+  read -t 10 -rp "> Would you like to do backup siletnly in background? (y|N) : " answer < /dev/tty
+  answer=$(echo "$answer" | awk '{ print tolower($0); }')
+  [ -z "$answer" ] && echo ""
+  if [ "$answer" = "y" ]; then
+   quiet_mode="true"
+   background_mode="true"
+  fi
+ fi
+
+ echo "[Info] Backup all targets has been started"
+ if [ "$background_mode" = "true" ]; then
+  local force_mode=""
+  if echo "$opt" | grep -q "|f|"; then
+   force_mode="true"
+  fi
+  echo "[Info] Backup all targets in porgess..."
+  ebackup_background "$presets" "$force_mode"
+ else
+  if [ "$quiet_mode" = "true" ]; then
+   quiet_mode="force_quiet"
+  fi
+  IFS=$'\n'; for line in ${presets}; do
+   echo "[Info] The backup of target '${line}' in porgess..."
+   ebackup_sync backup "$line" "$quiet_mode"
+   #sleep 1
+  done; unset IFS
+  echo "[Info] Backup all targets has been completed"
+ fi
+
+ return 0
+}
+
+ebackup_background() {
+ local presets="$1"
+ if [ -z "$presets" ]; then
+  echo "[ERROR] No preset"
+  return 1
+ fi
+ local force_mode="$2"
+
+ local background_path="${EBACKUP_PATH}/background"
+ [ ! -d "$background_path" ] && mkdir -p "$background_path"
+
+ local background_bash="${background_path}/background_bash"
+ local background_targets="${background_path}/background_targets"
+ local background_log="${background_path}/background.log"
+
+ if [ ! -f "$background_bash" ]; then
+cat > "$background_bash" <<EOF
+#!/bin/bash
+background_targets="$background_targets"
+target_presets=\$(cat "\$background_targets")
+if [ -z "\$target_presets" ]; then
+ echo "[\$(date +'%Y-%m-%d %H:%M:%S')] error - no preset defined"
+ exit 1
+fi
+if [ ! -f "/usr/local/sbin/ebackup" ]; then
+ echo "[\$(date +'%Y-%m-%d %H:%M:%S')] error - ebackup not found"
+ rm -f "\$background_targets"
+ exit 1
+fi
+echo "[\$(date +'%Y-%m-%d %H:%M:%S')] background backup start"
+IFS=\$'\n'; for line in \${target_presets}; do
+ echo "[Info] The backup of target '\${line}' in porgess..."
+ /usr/local/sbin/ebackup backup "\${line}" "force_quiet"
+done
+rm -f "\$background_targets"
+echo "[\$(date +'%Y-%m-%d %H:%M:%S')] background backup end"
+exit 0
+EOF
+  chmod +x "$background_bash"
+ fi
+
+ if [ -f "$background_targets" ]; then
+  if [ "$force_mode" != "true" ]; then
+   local answer=""
+   read -t 10 -rp "> Currently background backup is running. Would you like to drop this background backup and restart again? (y|N) : " answer < /dev/tty
+   answer=$(echo "$answer" | awk '{ print tolower($0); }')
+   [ -z "$answer" ] && echo ""
+   if [ "$answer" != "y" ]; then
+    echo "> the background backup has been cancelled"
+    return 0
+   fi
+  fi
+  ps ax | grep "$background_bash" | awk '{ print $1; }' | xargs kill -9 >/dev/null 2>&1
+  rm -f "$background_targets"
+ fi
+
+ echo "$presets" > "$background_targets"
+ nohup bash ${background_bash} >> ${background_log} 2>&1 &
+
+ return 0
+}
+
+ebackup_sync() {
+ local action=$(echo "$1" | grep -oE "^(backup|restore)$")
+ if [ -z "$action" ]; then
+  echo "[Error] No command (must be backup or restore)"
+  return 1
+ fi
+
+ local target="$2"
+ local silent_mode=$([ "$3" = "force_quiet" ] && echo "true" || echo "false")
+
+ local answer=""
+ if [ -z "$target" ]; then
+  if [ "$silent_mode" = "false" ]; then
+   echo "[Ellucy ebackup $action target list]"
+   local list=$(find "$EBACKUP_PRESET_PATH" -type f -name "*.conf" -printf '%f: %p\n' 2>/dev/null | sed "s/\.conf\:/ :/")
+   if [ -n "$list" ]; then
+    local detail=""
+    local number=0
+    IFS=$'\n'; for line in ${list}; do
+     (( number++ ))
+     detail=$(get_detail "$line")
+     echo "[$number] $line : $detail"
+    done; unset IFS
+    local option="[number/(a)ll/(c)ancel]: "
+    local filter="^([0-9]*|a)$"
+    if [ "$action" = "restore" ]; then
+     option="[number/(c)ancel]: "
+     filter="^[0-9]*$"
+    fi
+    read -t 10 -rp "> Please type a number of target or command letter ${option}" answer < /dev/tty
+    [ -z "$answer" ] && echo ""
+    answer=$(echo "$answer" | egrep "$filter")
+    if [ -z "$answer" ]; then
+     echo "> ${action} has been cancelled"
+     return 1
+    fi
+    if [ "$answer" = "a" ]; then
+     ebackup_all
+     return 0
+    else
+     target=$(echo "$list" | sed -n "${answer}"p | cut -d":" -f1 | xargs 2>/dev/null)
+    fi
+   else
+    echo "* there is no target"
+   fi
+  fi
+
+  if [ -z "$target" ]; then
+   echo "[Error] no $action target entered"
+   return 1
+  fi
+ fi
+
+ local preset="${EBACKUP_PRESET_PATH}/${target}.conf"
+ if [ ! -f "$preset" ]; then
+  echo "[ERROR] No target preset file found"
+  return 1
+ fi
+
+ local target_host=$(grep "^\[target_host\]" "$preset" | head -1 | cut -d"|" -f2-)
+ IFS='|'; target_host=( $target_host ); unset IFS;
+ local client_host="${target_host[0]}"
+ local client_port="${target_host[1]}"
+ local client_id="${target_host[2]}"
+
+ if [ -z "${client_host}" ]; then
+  echo "[ERROR] The target preset is wrong (host addr missing)"
+  return 1
+ fi
+
+ if [ "$silent_mode" = "true" ]; then
+  if [ "$action" = "restore" ]; then
+   echo "> ebackup restore does not support quiet mode"
+   return 0
+  fi
+ else
+  read -t 5 -rp "> Would you like to ${action} the target [${target}] at [${client_host}]? (y|N) : " answer < /dev/tty
+  answer=$(echo "$answer" | awk '{ print tolower($0); }')
+  [ -z "$answer" ] && echo ""
+  if [ "$answer" != "y" ]; then
+   echo "> the target [${target}] ${action} has been cancelled"
+   return 0
+  fi
+ fi
+
+ local rsync_opt="--timeout=3600 -ar"
+ local remote_host=""
+ local remote_connect=""
+ if [ "${client_host}" != "localhost" ]; then
+  if [ -z "${client_port}" ] || [ -z "${client_id}" ]; then
+   echo "[ERROR] The ebackup client port or login ID is missing"
+   return 1
+  fi
+
+  if [ "$silent_mode" = "true" ]; then
+   if [ ! -d "${EBACKUP_KEY_PATH}/${client_id}@${client_host}:${client_port}" ]; then
+    echo "[ERROR] The ebackup slient mode requires manual ssh-copy-id ahead of ${action}"
+    return 1
+   fi
+  fi
+
+  if ! client_check "${client_host}" "${client_port}" "${client_id}"; then
+   echo "[ERROR] The ebackup client host not working (host down or firewall or wrong configuration)"
+   echo "[INFO] Firewall should open ssh connection between host and client (${client_id}@${client_host}:${client_port})"
+   return 1
+  fi
+
+  if [ "$action" = "restore" ]; then
+   read -t 5 -rp "> restore requires sudo rsync. Would you like to add sudo rsync to ${client_id}@${client_host}? (y|N) : " answer < /dev/tty
+   answer=$(echo "$answer" | awk '{ print tolower($0); }')
+   [ -z "$answer" ] && echo ""
+   if [ "$answer" != "y" ]; then
+    echo "> the target [${target}] restore has been cancelled due to sudo rsync"
+    return 0
+   fi
+
+   if ! make_sudo_rsync "${client_host}" "${client_port}" "${client_id}"; then
+    echo "[ERROR] The ebackup restore requires sudo rsync"
+    return 1
+   fi
+  fi
+
+  rsync_opt="${rsync_opt}z"
+  remote_connect=" -e 'ssh -o ConnectTimeout=5 -o ServerAliveInterval=60 -o ServerAliveCountMax=60 -p ${client_port}'"
+  remote_host="${client_id}@${client_host}:"
+ fi
+
+ local tasks=$(cat "$preset" 2>/dev/null | grep -v "^\[target_host\]" | grep -v "^\s*[#;]" | grep -v "^[[:space:]]*$")
+ if [ -z "$tasks" ]; then
+  echo "[ERROR] No task defined"
+  return 1
+ fi
+
+ local direction=()
+ if [ "$action" = "restore" ]; then
+  direction=("to" "from")
+ else
+  direction=("from" "to")
+  echo "[$(date +"%Y-%m-%d %H:%M:%S")] backup \"${target}\" ${direction[0]} ${client_host}" >> "$EBACKUP_LOG"
+ fi
+
+ echo "[START] ${action} '${target}' in '${client_host}'"
+ local client_path=""
+ local backup_path=""
+ local restore_backup_path=""
+ local from=""
+ local to=""
+ local exclude=""
+ local owner=""
+ local perm=""
+ local rsync_path=""
+ local target_section=""
+ local sync_targets=""
+ local sync_files=""
+ local sync_command=""
+ local history_file=""
+ local rsync_info=""
+ local rsync_brief=""
+ local file_job=""
+ local file_job_list=""
+ local job_list=()
+
+ IFS=$'\n'; for line in ${tasks}; do
+  IFS='|'; line=( $line ); unset IFS
+  client_path="${line[0]}"
+  if [ "${client_path:0:1}" = "[" ]; then
+   job_list+=("--END--")
+   target_section=$(echo "${client_path}" | tr -d "[]")
+   echo "> checking ${target_section}"
+   job_list+=("--START--")
+   job_list+=("echo '> ${client_path} ${action} is in process'")
+   backup_path="${EBACKUP_HOST_PATH}/${target}/${target_section}"
+
+   owner=$(echo "${line[1]}" | grep -oE "^[a-zA-Z0-9_]*$")
+   if [ -n "$owner" ]; then
+    owner=" --chown=${owner}:${owner}"
+   fi
+
+   perm=$(echo "${line[2]}" | grep -oE "^(r|rx|rwx)$")
+   if [ -n "$perm" ]; then
+    if [ "$perm" = "rwx" ]; then
+     perm=" --perms --chmod=a+${perm}"
+    else
+     perm=" --perms --chmod=o+${perm}"
+    fi
+   fi
+
+   if [ "$action" = "restore" ]; then
+    if [ -z "${owner}${perm}" ]; then
+     file_job=""
+    else
+     file_job="true"
+    fi
+    owner=""
+    perm=""
+   fi
+  else
+   [ -z "$client_path" ] && continue
+
+   if [ "${client_path:0:1}" != "/" ]; then
+    echo "  - error > the client path '${client_path}' should be absolute"
+    continue
+   fi
+
+   if [ "${client_host}" = "localhost" ]; then
+    if [ ! -d "${client_path}" ]; then
+     echo "  - error > the host path '${client_path}' for local sync does not exists"
+     continue
+    fi
+   fi
+
+   exclude=""
+   if [ -n "${line[1]}" ] && [ "${line[1]}" != "none" ]; then
+    if echo "${line[1]}" | grep -q ","; then
+     exclude=$(echo "${line[1]}" | awk -F"," '{for(i=1;i<=NF;i++){printf "|%s|,", $i}; printf "\n"}' | tr "|" "'" | sed "s/\,$//")
+     exclude=" --exclude={$exclude}"
+    else
+     exclude=" --exclude '${line[1]}'"
+    fi
+   fi
+
+   sudo_action=""
+   rsync_path=""
+   if [ -n "$remote_host" ]; then
+    if [ "$action" = "backup" ]; then
+     if [ "${line[2]}" = "true" ]; then
+      if [ "$silent_mode" = "true" ]; then
+       if [ ! -f "${EBACKUP_KEY_PATH}/${client_id}@${client_host}:${client_port}/sudo_rsync_${client_id}" ]; then
+        echo "[ERROR] The ebackup slient mode cannot do sudo rsync"
+        continue
+       fi
+      else
+       if ! make_sudo_rsync "${client_host}" "${client_port}" "${client_id}"; then
+        echo "[ERROR] The sudo ebackup requires sudo rsync"
+        continue
+       fi
+      fi
+      sudo_action="sudo "
+     fi
+    else
+     sudo_action="sudo "
+    fi
+    rsync_path=" --rsync-path='${sudo_action}rsync'"
+   fi
+
+   if [ "$action" = "backup" ]; then
+    from="${remote_host}${client_path}"
+    to="${backup_path}/$(echo "$client_path" | rev | cut -d"/" -f2 | rev)/"
+   else
+    to="${remote_host}${client_path}"
+    from="${backup_path}/$(echo "$client_path" | rev | cut -d"/" -f2 | rev)/"
+    if [ ! -d "$from" ]; then
+     echo "  - the restore source for ${to} does not exists at ${from}"
+     continue
+    fi
+   fi
+   sync_targets=$(bash -c "rsync ${rsync_opt}vh --dry-run --stats --out-format=FILEDETAIL::%n --delete${exclude}${remote_connect}${rsync_path} '${from}' '${to}' 2>/dev/null")
+   rsync_info=$(get_rsyncinfo "$(echo "$sync_targets" | tail -16)" "$action")
+   rsync_brief=$(echo "$rsync_info" | grep "^\[rsync_brief\]" | awk '{$1=""}1' | xargs)
+   if [ -z "$rsync_brief" ]; then
+    echo "  - [Warning] ${action} source (${from}) has an error"
+    continue
+   fi
+   rsync_brief=( ${rsync_brief} )
+   # 0: total count, 1: total byte size, 2: transfer count, 3: transfer byte size, 4: transfer human count, 5: transfer human size, 6: approx. time (min)
+
+   if [ "${rsync_brief[0]}" = "0" ] || [ "${rsync_brief[1]}" -lt "100" ]; then
+    echo "  - [Warning] ${action} source (${from}) is empty"
+    continue
+   fi
+
+   if [ "${rsync_brief[2]}" = "0" ] || [ "${rsync_brief[3]}" = "0" ]; then
+    echo "  - nothing to ${action} ${direction[0]} ${from} ${direction[1]} ${to} (same)"
+    continue
+   fi
+
+   if [ "${rsync_brief[2]}" -gt "1000" ]; then
+    echo "  - [Warning] the number of ${action} files is larger than 1,000 (${rsync_brief[4]} files)"
+    if [ "$silent_mode" = "true" ]; then
+     continue
+    else
+     read -t 5 -rp "  - [Warning] massive file transfer is about to happen. Procceed? (y|N) : " answer < /dev/tty
+     answer=$(echo "$answer" | awk '{ print tolower($0); }')
+     [ -z "$answer" ] && echo ""
+     if [ "$answer" != "y" ]; then
+      echo "  - cancelled to ${action} ${direction[0]} ${from} ${direction[1]} ${to} due to massive transfer"
+      continue
+     fi
+    fi
+   fi
+
+   if [ "${rsync_brief[3]}" -gt "10737418240" ]; then
+    echo "  - [Warning] the transfer size of ${action} is bigger than 10GB (${rsync_brief[5]}B)"
+    if [ "$silent_mode" = "true" ]; then
+     continue
+    else
+     read -t 5 -rp "  - [Warning] this will take so long time (arrpox. ${rsync_brief[6]}min) Procceed? (y|N) : " answer < /dev/tty
+     answer=$(echo "$answer" | awk '{ print tolower($0); }')
+     [ -z "$answer" ] && echo ""
+     if [ "$answer" != "y" ]; then
+      echo "  - cancelled to ${action} ${direction[0]} ${from} ${direction[1]} ${to} due to over transfer size"
+      continue
+     fi
+    fi
+   fi
+
+   sync_targets=$(echo "$sync_targets" | awk '{$1=$1};1' | grep -v "^$" | grep -E "^(FILEDETAIL\:\:|deleting )")
+   if [ -z "$sync_targets" ]; then
+    echo "  - nothing to ${action} ${direction[0]} ${from} ${direction[1]} ${to} (error)"
+    continue
+   fi
+   sync_targets=$(echo "$sync_targets" | grep -v "\/$")
+
+   if [ "$EBACKUP_RANSOM_CHECK" = "true" ]; then
+    if [ "${line[3]}" = "true" ]; then
+     EBACKUP_BIG_VAR=$(echo "$sync_targets" | grep "^FILEDETAIL\:\:" | sed "s/^FILEDETAIL\:\:/\//g")
+     if ! ransomware_check; then
+      echo "  - [Warning] the target (${from}) are suspicious of ransomware (${rsync_brief[4]} files, ${rsync_brief[5]}B)"
+      continue
+     fi
+    fi
+   fi
+
+   echo "  - ${action} detail: ${direction[0]} ${from} ${direction[1]} ${to}"
+   echo "$rsync_info" | grep -v "^\[rsync_brief\]" | awk '{ if ( $1 ~ /^\[/ ) { print "   "$0; } else { print "    - "$0; } }'
+   job_list+=("echo '  - ${action} ${direction[0]} ${from} ${direction[1]} ${to} has been started'")
+   job_list+=("echo '  - ${action} info: ${rsync_brief[4]} files, ${rsync_brief[5]}B'")
+   job_list+=("echo '  - ${action} start at '\$(date +\"%Y-%m-%d %H:%M:%S\")")
+
+   if [ "$action" = "backup" ]; then
+    if [ ! -d "${to}" ]; then
+     job_list+=("mkdir -p '${to}'")
+     if [ -n "$owner" ]; then
+      job_list+=("chown -R $(echo "${owner}" | cut -d= -f2) '${to}'")
+     fi
+    fi
+
+    history_file=""
+    if [ "${line[4]}" = "true" ]; then
+     sync_files=$(echo "$sync_targets" | sed -r "s/^(FILEDETAIL\:\:|deleting )//g")
+     if [ -n "$sync_files" ]; then
+      job_list+=("echo '  - history backup in process'")
+      history_file=$(mktemp)
+      echo "${sync_files}" > "${history_file}"
+      job_list+=("history_backup '${target}' '${target_section}' '${to}' '${history_file}'")
+      job_list+=("rm -f '${history_file}'")
+     fi
+    fi
+   else
+    if [ "$file_job" = "true" ]; then
+     file_job_list+=" '${to}'"
+    fi
+    restore_backup_path="${EBACKUP_HOST_PATH}/restore/${target}/${target_section}/"
+    job_list+=("echo '  - backup resotre target at backup host before restore start'")
+    job_list+=("rm -f '${restore_backup_path}'")
+    job_list+=("mkdir -p '${restore_backup_path}'")
+    job_list+=("rsync ${rsync_opt} ${remote_connect}${rsync_path} '${to}' '${restore_backup_path}'")
+   fi
+
+   sync_command="rsync ${rsync_opt} --delete${exclude}${owner}${perm}${remote_connect}${rsync_path} '${from}' '${to}'"
+   sync_command+=" && echo '  - completed to ${action}'"
+   sync_command+=" || echo '  - error occurred while ${action}'"
+   job_list+=("${sync_command}")
+
+   job_list+=("echo '  - ${action} end at '\$(date +\"%Y-%m-%d %H:%M:%S\")")
+  fi
+ done; unset IFS
+ job_list+=("--END--")
+ job_list=$(for i in $(seq 1 $((${#job_list[@]}-1))); do echo "${job_list[$i]}"; done)
+ job_list=$(echo "$job_list" | sed -n '/--START--/{:a;N;/--END--/!ba; /rsync /p}' | grep -vE "^--(START|END)--$")
+ echo "> checking completed"
+
+ if [ -n "$job_list" ]; then
+  if [ "$action" = "backup" ]; then
+   echo "[Transfer] transfer target \"${target}\" is in progress..."
+   IFS=$'\n'; for line in ${job_list}; do
+    eval "${line}"
+   done; unset IFS
+  else
+   ebackup_restore "$job_list" "$target_host" "$file_job_list"
+  fi
+ fi
+ echo "[END] ${action} '${target}' at '${client_host}'"
+
+ return 0
+}
+
+ebackup_restore() {
+ local job_list="$1"
+ if [ -z "$job_list" ]; then
+  echo "[Error] Required argument is missing"
+  return 1
+ fi
+ local target_host="$2"
+ local file_job_list="$3"
+
+ local client_host="${target_host[0]}"
+ local client_port="${target_host[1]}"
+ local client_id="${target_host[2]}"
+
+ echo "Restore Info for ${client_host}"
+ echo "> ebackup does not provide auto restore for file safe"
+ echo "> you can restore the target referring to followings as super user"
+ echo ""
+ IFS=$'\n'; for line in ${job_list}; do
+  if [ "${line:0:4}" = "echo" ]; then
+   eval "${line}"
+  else
+   echo "$line"
+  fi
+ done; unset IFS
+ echo ""
+
+ local file_job=""
+ if [ -n "$file_job_list" ]; then
+  echo "> post job for permissions"
+  file_job_list=${file_job_list#" "}
+  file_job="for i in ${file_job_list}; do v=\$(stat -c \"chmod -R %a '%n'; chown -R %U:%G '%n'\" \"\$i\"); eval \"\$v\" 2>/dev/null; done"
+  if [ "${client_host}" != "localhost" ]; then
+   file_job=$(echo "$file_job" | sed 's/\"/\\"/g' | sed 's/\$/\\$/g')
+   file_job="ssh -p ${client_port} ${client_id}@${client_host} \"$file_job\""
+  fi
+  echo "$file_job"
+  echo ""
+ fi
+
+ return 0
+}
+
+ransomware_check() {
+ [ -z "$EBACKUP_BIG_VAR" ] && return 0
+
+ EBACKUP_BIG_VAR=$(echo "$EBACKUP_BIG_VAR" | awk -F"/" '{ print $NF; }' | cut -d"," -f1)
+ local check_count=$(echo "${EBACKUP_BIG_VAR}" | wc -l 2>/dev/null)
+ if [ -z "$check_count" ] || [ "$check_count" = "0" ]; then
+  return 0
+ fi
+
+ local max_check_count=300
+ local max_pattern_check_count=20
+ local max_suspicious_point=10
+
+ local ransom_path="${EBACKUP_PATH}/ransomware"
+ [ ! -d "$ransom_path" ] && mkdir -p "$ransom_path"
+
+ local ransom_pattern=""
+ local ransom_list="${ransom_path}/ransom.list"
+ if [ -f "$ransom_list" ]; then
+  local pastsecond=$(( $(date +%s) - $(date -r "$ransom_list" +%s) ))
+  if [ "$pastsecond" -le $(( 30 * 86400 )) ]; then
+   ransom_pattern=$(cat "$ransom_list")
+  fi
+ fi
+
+ if ! echo "$ransom_pattern" | grep -q "lastUpdated"; then
+  ransom_pattern=""
+  local pattern_link="https://fsrm.experiant.ca/api/v1/combined"
+  local tmp_file=$(mktemp)
+  local http_code=$(curl -L --connect-timeout 5 --max-time 10 -o "$tmp_file" -s -w "%{http_code}" "$pattern_link")
+  if [ "$http_code" = "200" ] || [ "$http_code" = "302" ]; then
+   ransom_pattern=$(cat "$tmp_file" | sed -e "s/\"\,/\"\n/g" -e "s/\[\"/\n/g" -e "s/\]\}$//" -e "s/},\"lastUpdated\"/\"\n\"lastUpdated\"/" | tail -n +2)
+   if [ -n "$ransom_pattern" ]; then
+    ransom_pattern=$(echo "$ransom_pattern" | sed "s/\"//g" | awk '{gsub(/[*]+/,"*")}1')
+    local tmp_pattern=$(echo "$ransom_pattern"  | grep -v "*" | sed '/filters:/c\filters:\n#/pattern_name_start/#')
+    ransom_pattern=$(echo "$ransom_pattern" | grep "*")
+    tmp_pattern+="\n#/pattern_name_end/#\n#/pattern_ext_start/#\n"
+    local test_pattern=$(echo "$ransom_pattern" | grep "\.[^*]*$" | awk -F"." '{if (length($NF) > 3 && $NF != "html" && $NF != "info") { print tolower($NF); } else { if ( $(NF-1) == "*" ) { print tolower($NF); } else { print "(match)"$(NF-1); } }}' | awk '{$1=$1};1' | sort -u)
+    tmp_pattern+=$(echo "$test_pattern" | grep -v "^(match)" | grep -vE "(html|txt|egg|htm|js)")
+    tmp_pattern+="\n#/pattern_ext_end/#\n#/pattern_match_start/#\n"
+    tmp_pattern+=$(echo "$test_pattern" | grep "^(match)" | cut -d")" -f2- | awk 'length($0) > 7' | sed 's/[]\[\|()?+-=:.^$]/\\&/g' | sed 's/\*/.*/g')
+    tmp_pattern+=$(echo "$ransom_pattern" | grep -v "\.[^*]*$" | awk 'length($0) > 7' | sed 's/[]\[\|()?+-=:.^$]/\\&/g' | sed 's/\*/.*/g')
+    tmp_pattern+="\n#/pattern_match_end/#"
+    echo -e "$tmp_pattern" > "$ransom_list"
+    mv -f "$tmp_file" "${ransom_path}/ransom.json"
+    ransom_pattern=$(cat "$ransom_list")
+   fi
+  fi
+  rm -f "$tmp_file"
+ fi
+ [ -z "$ransom_pattern" ] && return 0
+
+ local pat=()
+ for t in name ext match; do
+  pat+=( "$(echo "$ransom_pattern" | sed -n "/\#\/pattern_${t}_start\/\#/,/\#\/pattern_${t}_end\/\#/p" | grep -v "^#/pattern_${t}_")" )
+ done
+
+ local loop_mod=$((${check_count}/${max_check_count}+1))
+ local pattern_mod=$((${check_count}/${max_pattern_check_count}+1))
+ local test_val=""
+ local mod_check=0
+ local loop_count=0
+ local suspicious_point=0
+ IFS=$'\n'; for line in ${EBACKUP_BIG_VAR}; do
+  if [ "$suspicious_point" -ge "${max_suspicious_point}" ]; then
+   break
+  fi
+  ((loop_count++))
+
+  mod_check=$((${loop_count}%${loop_mod}))
+  if [ "$mod_check" != "0" ]; then
+   continue
+  fi
+
+  if echo "$line" | grep -q "\."; then
+   test_val="${line##*.}"
+   if [ "${#test_val}" -ge "12" ]; then
+    if echo "$test_val" | grep -vq "^log"; then
+     ((suspicious_point++))
+     continue
+    fi
+   fi
+   test_val=$(echo "$test_val" | sed 's/[]\[\|()?+-=:.^$]/\\&/g')
+   if echo "${pat[1]}" | grep -q "^${test_val}$"; then
+    suspicious_point=$((${suspicious_point}+3))
+    continue
+   fi
+  fi
+
+  test_val=$(echo "$line" | sed 's/[]\[\|()?+-=:.^$]/\\&/g')
+  if echo "${pat[0]}" | grep -q "^${test_val}$"; then
+   suspicious_point=100
+   break
+  fi
+
+  mod_check=$((${loop_count}%${pattern_mod}))
+  if [ "$mod_check" != "0" ]; then
+   continue
+  fi
+
+  for pattern in ${pat[2]}; do
+   if echo "$line" | grep -q "${pattern}"; then
+    suspicious_point=100
+    break
+   fi
+  done
+ done; unset IFS
+ EBACKUP_BIG_VAR=""
+
+ if [ "$suspicious_point" -ge "$max_suspicious_point" ]; then
+  return 1
+ fi
+
+ return 0
+}
+
+history_backup() {
+ [ ! -d "$EBACKUP_HISTORY_PATH" ] && return 1
+
+ local target="$1"
+ local target_section="$2"
+ local target_path="$3"
+ local history_file="$4"
+
+ if [ -z "$target" ] || [ -z "$target_section" ] || [ -z "$target_path" ] || [ ! -f "$history_file" ]; then
+  echo "  - failed make history backup"
+  return 1
+ fi
+
+ local backup_path="${EBACKUP_HISTORY_PATH}/${target}/${target_section}/"$(echo "${target_path}" | awk -F"/${target}/${target_section}/" '{ print $NF; }')
+ local datetime=$(date +"%Y%m%d%H%M")
+
+ local count=0
+ local mv_path=""
+ local target_file=""
+ IFS=$'\n'; for line in $(cat "$history_file"); do
+  target_file=$(echo "${target_path}/${line}" | sed "s#//#/#g")
+  [ ! -f "$target_file" ] && continue
+
+  mv_path="${backup_path}/$(echo "$line" | grep "/" | rev | cut -d"/" -f2- | rev)/${datetime}/"
+  [ ! -d "$mv_path" ] && mkdir -p "$mv_path"
+  mv -f "$target_file" "$mv_path"
+  ((count++))
+ done; unset IFS
+
+ if [ "$count" -gt "0" ]; then
+  echo -e "[$(date +"%Y-%m-%d %H:%M:%S")] History backup for \"${target}\" at ${backup_path} (${count} files)" >> "$EBACKUP_LOG"
+  echo "  - completed ${count} files of history backup"
+ fi
+
+ return 0
+}
+
+status() {
+ local rsync_version=$(rsync --version | grep version | head -1 | awk '{ print $1" "$3; }')
+ local config=$(cat "$EBACKUP_CONFIG" 2>/dev/null)
+ local list=$(find "$EBACKUP_PRESET_PATH" -type f -name "*.conf" -printf '%f: %p\n' 2>/dev/null | sed "s/\.conf\:/ :/")
+ local cron_status="> status: disabled"
+ if [ "$EBACKUP_CRON_JOB" = "true" ] && [ -n "$EBACKUP_CRON_TIME" ]; then
+  local time_data=$(echo "$EBACKUP_CRON_TIME" | sed "s/\*/A/g")
+  local period=""
+  local cron_time=()
+  IFS=','; cron_time=( ${time_data} ); unset IFS;
+  if [ "${cron_time[4]}" != "A" ]; then
+   period="weekly"
+  elif [ "${cron_time[3]}" != "A" ]; then
+   period="yearly"
+  elif [ "${cron_time[2]}" != "A" ]; then
+   period="monthly"
+  elif [ "${cron_time[1]}" != "A" ]; then
+   period="daily"
+  else
+   period="hourly"
+  fi
+  local num_val=""
+  local weekdays=(sun mon tue wed thu fri sat)
+  for i in $(seq 0 $((${#cron_time[@]}-1))); do
+   num_val="${cron_time[$i]}"
+   if echo "$num_val" | grep -qE "^[0-9]*$"; then
+    if [ "$i" = "4" ]; then
+     cron_time[$i]="${weekdays[${num_val}]}"
+    else
+     if [ "${#num_val}" = "1" ]; then
+      cron_time[$i]="0${num_val}"
+     fi
+    fi
+   fi
+  done
+  if [ "${cron_time[4]}" != "A" ]; then
+   cron_time[4]=$(date -d "${cron_time[4]}" +%A)
+  fi
+
+  cron_status="> status: enabled
+> period: $period
+> backup schedule:
+  >> date: ${cron_time[3]}-${cron_time[2]}
+  >> time: ${cron_time[1]}:${cron_time[0]}
+  >> weekday: ${cron_time[4]}"
+  cron_status=$(echo "$cron_status" | sed "s/A\-A/all/g" | sed "s/A/\*/g")
+ fi
+
+printf "[Ellucy ebackup status report]
+
+1. rsync version:
+%s
+
+2. Config:
+%s
+
+3. Target List:
+%s
+
+4. Cron Job
+%s
+
+5. Log:
+%s
+%s
+
+" "${rsync_version}" "${config}" "${list}" "${cron_status}" "${EBACKUP_LOG}" "${EBACKUP_PATH}/background/background.log"
+
+ return 0
+}
+
+set_config() {
+ local item="$1"
+ local value="$2"
+ if [ -z "$item" ] || [ -z "$value" ]; then
+  echo "[ERROR] required arguments missing"
+  return 1
+ fi
+
+ item=($(echo "$item" | awk '{ print toupper($1); }'))
+ if [ -z "$(echo "$item" | grep -oE "^(EBACKUP_HOST_PATH|EBACKUP_HISTORY_PATH|EBACKUP_RANSOM_CHECK|EBACKUP_CRON_JOB|EBACKUP_CRON_TIME)$")" ]; then
+  echo "[ERROR] You can set within these configs (ebackup_host_path|ebackup_history_path|ebackup_cron_job|ebackup_cron_time)"
+  return 1
+ fi
+
+ value=$(echo "$value" | awk '{ print tolower($1); }')
+ local valid_limit=""
+ if [ "$item" = "EBACKUP_HOST_PATH" ] && [ -z "$(echo "$value" | grep "^/[a-zA-Z]")" ]; then
+  valid_limit="absolute path starting with /[alphabet]"
+ elif [ "$item" = "EBACKUP_HISTORY_PATH" ] && [ -z "$(echo "$value" | grep "^/[a-zA-Z]")" ]; then
+  valid_limit="absolute path starting with /[alphabet]"
+ elif [ "$item" = "EBACKUP_RANSOM_CHECK" ] && [ -z "$(echo "$value" | grep -oE "^(true|false)$")" ]; then
+  valid_limit="true|false"
+ elif [ "$item" = "EBACKUP_CRON_JOB" ] && [ -z "$(echo "$value" | grep -oE "^(true|false)$")" ]; then
+  valid_limit="true|false"
+ elif [ "$item" = "EBACKUP_CRON_TIME" ]; then
+  if ! check_crontime "$value"; then
+   valid_limit="minutes[0-59],hour[0-23*],day[1-31*],month[1-12*jan],weekday[0-6*mon]"
+  fi
+ fi
+
+ if [ -n "$valid_limit" ]; then
+  echo "[ERROR] You can set ${item} within these values (${valid_limit})"
+  return 1
+ fi
+
+ if cat "$EBACKUP_CONFIG" | grep -q "^${item}=${value}$"; then
+  echo "[INFO] configuration is same"
+  return 0
+ fi
+
+ sed -i -r "s#^${item}=.*#${item}=${value}#" "$EBACKUP_CONFIG"
+ if [ "$item" = "EBACKUP_CRON_JOB" ] || [ "$item" = "EBACKUP_CRON_TIME" ]; then
+  load_config
+ fi
+
+ echo "[INFO] configuration has been changed"
+ cat "$EBACKUP_CONFIG"
+
+ return 0
+}
+
+check_minmax() {
+ local raw_data="$1"
+ if [ -z "$raw_data" ]; then
+  echo ""
+ else
+  if [ -z "$(echo "$raw_data" | grep -oE "^[0-9]*$")" ]; then
+   echo "$raw_data"
+  else
+   local min_val=$(echo "$2" | grep -oE "^[0-9]*$")
+   local max_val=$(echo "$3" | grep -oE "^[0-9]*$")
+   if [ -n "$min_val" ] && [ -n "$max_val" ]; then
+    if [ "$raw_data" -ge "$min_val" ] && [ "$raw_data" -le "$max_val" ]; then
+     echo "$raw_data"
+    else
+     echo ""
+    fi
+   else
+    echo ""
+   fi
+  fi
+ fi
+
+ return 0
+}
+
+check_crontime() {
+ local raw_data=$(echo "$1" | sed "s/\*/A/g")
+ [ -z "$raw_data" ] && return 1
+
+ local cron_time=()
+ IFS=','; cron_time=( ${raw_data} ); unset IFS;
+ if [ "${#cron_time[@]}" = "5" ]; then
+  local min=$(check_minmax "$(echo "${cron_time[0]}" | grep -oE "^[0-9]*$")" 0 59)
+  local hour=$(check_minmax "$(echo "${cron_time[1]}" | grep -oE "^([0-9]*|A)$")" 0 23)
+  local day=$(check_minmax "$(echo "${cron_time[2]}" | grep -oE "^([0-9]*|A)$")" 1 31)
+  local mon=$(check_minmax "$(echo "${cron_time[3]}" | grep -oE "^([0-9]*|A|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)$")" 1 12)
+  local weekday=$(check_minmax "$(echo "${cron_time[4]}" | grep -oE "^([0-9]*|A|sun|mon|tue|wed|thu|fri|sat)$")" 0 6)
+  if [ -n "$min" ] && [ -n "$hour" ] && [ -n "$day" ] && [ -n "$mon" ] && [ -n "$weekday" ]; then
+   return 0
+  fi
+ fi
+
+ return 1
+}
+
+set_crontab() {
+ local cron_file="/etc/cron.d/ebackup"
+ if [ "$EBACKUP_CRON_JOB" = "true" ] && [ -n "$EBACKUP_CRON_TIME" ]; then
+  local search=$(echo "$EBACKUP_CRON_TIME" | tr "," " " | sed "s/\*/\\\*/g")
+  if ! cat "$cron_file" 2>/dev/null | grep -q "^${search} "; then
+   echo "$(echo "$EBACKUP_CRON_TIME" | tr "," " ") root [ -f /usr/local/sbin/ebackup ] && /usr/local/sbin/ebackup backup_all -b -f" > "$cron_file"
+  fi
+ else
+  rm -f "$cron_file"
+ fi
+
+ return 0
+}
+
+load_config() {
+ if [ -f "$EBACKUP_CONFIG" ]; then
+  source "$EBACKUP_CONFIG"
+ fi
+
+ if [ -z "$EBACKUP_HOST_PATH" ]; then
+  echo "The ebackup host path is not set up yet. Please setup host path first."
+  local answer=""
+  while [ -z "$answer" ]; do
+   read -t 30 -rp "> ebackup host path : " answer < /dev/tty
+   if [ -z "$answer" ]; then
+    answer="cancelled"
+   else
+    if [ -z "$(echo "$answer" | grep "/")" ] || [ -n "$(echo "$answer" | grep -q " " && echo "space")" ] || [ echo "${answer:0:1}" != "/" ]; then
+     echo "> Please type valid path for ebackup (absolute path, no space)"
+     answer=""
+    fi
+   fi
+  done
+
+  if [ "$answer" = "cancelled" ] || ! mkdir -p "$answer" 2>/dev/null; then
+   echo "ebackup host path is not setup"
+   return 1
+  fi
+
+  EBACKUP_HOST_PATH=$(echo "$answer" | sed "s/\/$//")
+ fi
+ [ ! -d "$EBACKUP_HOST_PATH" ] && mkdir -p "$EBACKUP_HOST_PATH"
+
+ if [ -z "$EBACKUP_HISTORY_PATH" ]; then
+  EBACKUP_HISTORY_PATH="$EBACKUP_HOST_PATH/history"
+ fi
+ [ ! -d "$EBACKUP_HISTORY_PATH" ] && mkdir -p "$EBACKUP_HISTORY_PATH"
+
+ if [ -z "$(echo "$EBACKUP_RANSOM_CHECK" | grep -oE "^(true|false)$")" ]; then
+  EBACKUP_RANSOM_CHECK="false"
+ fi
+
+ if [ -z "$(echo "$EBACKUP_CRON_JOB" | grep -oE "^(true|false)$")" ]; then
+  EBACKUP_CRON_JOB="false"
+ fi
+
+ if [ "$EBACKUP_CRON_JOB" = "true" ]; then
+  if [ -n "$EBACKUP_CRON_TIME" ]; then
+   EBACKUP_CRON_TIME=$(echo "$EBACKUP_CRON_TIME" | sed "s/ //g")
+   if ! check_crontime "$EBACKUP_CRON_TIME"; then
+    EBACKUP_CRON_TIME=""
+   fi
+  fi
+  if [ -z "$EBACKUP_CRON_TIME" ]; then
+   EBACKUP_CRON_TIME="0,4,*,*,*"
+  fi
+ fi
+ set_crontab
+
+ local ebackup_conf=""
+read -r -d '' ebackup_conf <<-EOL || true
+EBACKUP_HOST_PATH=${EBACKUP_HOST_PATH}
+EBACKUP_HISTORY_PATH=${EBACKUP_HISTORY_PATH}
+EBACKUP_RANSOM_CHECK=${EBACKUP_RANSOM_CHECK}
+EBACKUP_CRON_JOB=${EBACKUP_CRON_JOB}
+EBACKUP_CRON_TIME=${EBACKUP_CRON_TIME}
+EOL
+
+ if [ "$(cat ${EBACKUP_CONFIG} 2>/dev/null)" != "${ebackup_conf}" ]; then
+  echo "${ebackup_conf}" > "${EBACKUP_CONFIG}"
+ fi
+
+ return 0
+}
+
+check_app() {
+ local required_app="sudo rsync ssh nano cron"
+ local need_install=()
+ for a in ${required_app}; do
+  if ! exists ${a}; then
+   need_install+=("${a}")
+  fi
+ done
+ need_install=$(echo ${need_install[@]} | xargs)
+ if [ -z "$need_install" ]; then
+  return 0
+ fi
+
+ if ! check_internet; then
+  return 1
+ fi
+
+ if [ -f "/etc/apt/sources.list" ]; then
+  apt-get -qq update && apt-get install -y -q ${need_install}
+ elif [ -d "/etc/yum.repos.d" ]; then
+  yum -y -q update && yum -y -q install ${need_install}
+ fi
+
+ return 0
+}
+
+init_check() {
+ if [ -z "$command" ]; then
+  echo "Ellucy EBACKUP Version $VERSION"
+  exit 0
+ fi
+
+ if [ $(id -u) -ne 0 ]; then
+  echo "Please run as root"
+  exit 1
+ fi
+
+ if ! check_app; then
+  echo "Could not find or install required app"
+  exit 1
+ fi
+
+ if [ ! -d "${EBACKUP_PATH}" ]; then
+  mkdir -p "${EBACKUP_PATH}"
+ fi
+
+ if [ ! -d "${EBACKUP_PRESET_PATH}" ]; then
+  mkdir -p "${EBACKUP_PRESET_PATH}"
+ fi
+
+ if ! load_config; then
+  exit 1
+ fi
+
+ return 0
+}
+
+help() {
+echo "Ellucy ebackup $VERSION
+Copyright: Jack Nam(jacknam@ellucy.com)
+
+Commands:
+backup            backup from client
+restore           restore to client
+backup_all        backup all clients defined in preset
+set               set config
+status            print enginx status and config
+edit              edit ebackup target
+
+Usage:
+ebackup (backup|restore) config_preset
+ebackup (set) item value
+ebackup status
+ebackup edit
+"
+ return 0
+}
+
+init_check
+case "$command" in
+ backup)
+  ebackup_sync backup "${@:2}"
+  ;;
+ restore)
+  ebackup_sync restore "${@:2}"
+  ;;
+ backup_all)
+  ebackup_all "${@:2}"
+  ;;
+ edit)
+  edit_target "${@:2}"
+  ;;
+ set)
+  set_config "${@:2}"
+  ;;
+ status)
+  status
+  ;;
+ help)
+  help
+  ;;
+ *)
+  echo "[ERROR] Command not found. (please refer to help. ebackup help)"
+esac
+
+exit 0

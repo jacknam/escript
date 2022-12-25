@@ -1,0 +1,445 @@
+#!/bin/bash
+#
+# developed by jacknam@ellucy.com
+#
+VERSION=0.1
+DOCKER_PATH="/etc/docker"
+EDOCKER_PATH="/opt/docker"
+EDOCKER_CONFIG="${EDOCKER_PATH}/edocker.conf"
+command="$1"
+mode="$2"
+value="$3"
+docker_repo=""
+
+exists() {
+ command -v "$1" >/dev/null 2>&1
+}
+
+check_internet() {
+ if ip route 2>/dev/null | grep -q default; then
+  nc -zw1 1.1.1.1 53 >/dev/null 2>&1 && return 0
+ fi
+ return 1
+}
+
+get_version() {
+ local ver=""
+ if exists docker; then
+  ver=$(docker -v | awk '{ gsub(/\,/,""); print $3; }')
+ fi
+ echo $ver
+}
+
+add_docker_repo() {
+ apt-get -y install curl lsb-release gnupg2 ca-certificates software-properties-common apt-transport-https
+
+ local os_code=($(lsb_release -a 2>/dev/null | xargs | awk '{ print tolower($3" "$NF); }'))
+ local repo_file="/etc/apt/sources.list.d/docker-${os_code[0]}-stable-${os_code[1]}.list"
+ if [ -f "$repo_file" ]; then
+  return 0
+ fi
+ rm -f /etc/apt/sources.list.d/docker*
+
+ # docker official public key
+ if [ -z "$(apt-key fingerprint 0EBFCD88 2>/dev/null)" ]; then
+  curl -fsSL https://download.docker.com/linux/${os_code[0]}/gpg | sudo apt-key add -
+ fi
+
+ local repo="[arch=amd64] https://download.docker.com/linux/${os_code[0]} ${os_code[1]} stable"
+ echo -e "deb ${repo}\n# deb-src ${repo}" > "$repo_file"
+ apt-get -y update
+
+ return 0
+}
+
+install_docker() {
+ if ! check_internet; then
+  echo "Please check your internet connection"
+  return 1
+ fi
+
+ add_docker_repo
+
+ local need_install=""
+ local i_ver="$(get_version)"
+ local c_ver=$(apt-cache policy "docker-ce" | grep "Candidate:" | head -1 | awk '{ split($2,v,"-"); print v[1]; }' | xargs | sed -r -e "s/.*\://" -e "s/(\-|\+|\~).*//")
+ if [ -z "$c_ver" ]; then
+  echo "There is no candidate of docker-ce to be installed"
+  return 1
+ fi
+
+ if [ "$i_ver" != "$c_ver" ]; then
+  if systemctl status docker >/dev/null 2>&1; then
+   read -rp "[Warning] docker is currently running. Install requires stop all docker process. Procceed? (y|N) : " answer
+   answer=$(echo "$answer" | awk '{ print tolower($0); }')
+   if [ "$answer" != "y" ]; then
+    echo "docker installation has been cancelled"
+    return 1
+   fi
+   docker stop $(docker ps -a -q)
+   systemctl stop docker
+  fi
+  apt-get -y remove docker docker-engine docker.io containerd runc docker-ce
+  apt-get -y autoremove
+  apt-get -y install docker-ce docker-compose
+  set_docker
+ fi
+
+ return 0
+}
+
+set_docker() {
+ exists docker || return 1
+ [ ! -d "${DOCKER_PATH}" ] && return 1
+
+read -r -d '' docker_daemon_config <<-EOL || true
+{
+ "bip": "${DOCKER_GATEWAY}/24",
+ "ipv6": ${DOCKER_IPV6},
+ "fixed-cidr-v6": "2001:db8:1::/64",
+ "iptables": ${DOCKER_IPTABLES},
+ "userland-proxy": ${DOCKER_NAT},
+ "log-driver": "json-file",
+ "log-opts": {
+  "max-size": "${DOCKER_LOGSIZE}",
+  "max-file": "5"
+ }
+}
+EOL
+
+ local docker_daemon_json="${DOCKER_PATH}/daemon.json"
+ if [ "$(cat ${docker_daemon_json} 2>/dev/null)" != "${docker_daemon_config}" ]; then
+  echo "${docker_daemon_config}" > "${docker_daemon_json}"
+
+  local running_container=$(docker ps -q | xargs)
+  docker stop ${running_container}
+  systemctl restart docker
+  docker start ${running_container}
+ fi
+
+ return 0
+}
+
+clean_docker() {
+ exists docker || return 1
+
+ local images=$(docker images -a -q | xargs)
+ [ -z "$images" ] && return 0
+
+ docker system prune
+ return 0
+}
+
+reset_docker() {
+ exists docker || return 1
+
+ local images=$(docker images -a -q | xargs)
+ [ -z "$images" ] && return 0
+
+ read -rp "[Warning] reset command will remove all docker images and networks. Procceed? (y|N) : " answer
+ answer=$(echo "$answer" | awk '{ print tolower($0); }')
+ if [ "$answer" != "y" ]; then
+  echo "docker reset has been cancelled"
+  return 0
+ fi
+
+ docker stop $(docker ps -a -q)
+ docker rm $(docker ps -a -q)
+ docker system prune -a
+
+ return 0
+}
+
+create_network() {
+ exists docker || return 1
+
+ echo -n "The iface name of network [name|(c)ancel]: "
+ local name=""
+ while [ -z "$name" ]; do
+  read name
+  if [ -n "$name" ]; then
+   name=$(echo "$name" | awk '{ print tolower($1); }')
+   if [ "$name" != "c" ]; then
+    if ifconfig | grep flags | grep -q "$name"; then
+     echo "[Warning] There is a network which has same iface name you entered"
+     name=""
+    fi
+   fi
+  fi
+  if [ -z "$name" ]; then
+   echo -n "The iface name of network [name|(c)ancel]: "
+  fi
+ done
+ if [ "$name" = "c" ]; then
+  echo "[Info] Network creation has been cancelled"
+  return 0
+ fi
+
+ echo -n "The gateway ip of network [ip|(c)ancel]: "
+ local gwip=""
+ while [ -z "$gwip" ]; do
+  read gwip
+  if [ -n "$gwip" ]; then
+   gwip=$(echo "$gwip" | awk '{ print tolower($1); }')
+   if [ "$gwip" != "c" ]; then
+    gwip=$(echo "$gwip" | grep -oE "^[1-9]{1}[0-9]{0,2}\.([0-9]{1,3}\.){2}")
+    if [ -n "$gwip" ]; then
+     if ifconfig | grep " inet " | grep -q "$gwip"; then
+      echo "[Warning] There is a conflicting gateway ip"
+      gwip=""
+     fi
+    fi
+   fi
+  fi
+  if [ -z "$gwip" ]; then
+   echo -n "The gateway ip of network [ip|(c)ancel]: "
+  fi
+ done
+ if [ "$gwip" = "c" ]; then
+  echo "[Info] Network creation has been cancelled"
+  return 0
+ fi
+
+ name=$(echo "$name" | sed "s/ //g" | xargs)
+ docker network create ${name} --driver=bridge --subnet=${gwip}0/24 --gateway=${gwip}1 --ip-range=${gwip}0/24 --opt com.docker.network.bridge.name=${name}
+ echo "[Info] docker network named '${name}' has been created at ${gwip}1"
+ docker network ls
+
+ return 0
+}
+
+set_config() {
+ if [ -z "$mode" ] || [ -z "$value" ]; then
+  echo "[Error] required arguments missing"
+  return 1
+ fi
+
+ mode=($(echo "$mode" | awk '{ print toupper($1); }'))
+ if [ -z "$(echo "$mode" | grep -oE "^(DOCKER_GATEWAY|DOCKER_LOGSIZE|DOCKER_IPV6|DOCKER_IPTABLES|DOCKER_NAT)$")" ]; then
+  echo "[Error] You can set within these configs (docker_gateway|docker_logsize|docker_ipv6|docker_iptables|docker_nat)"
+  return 1
+ fi
+
+ value=$(echo "$value" | awk '{ print tolower($1); }')
+ local valid_limit=""
+ if [ "$mode" = "DOCKER_GATEWAY" ] && [ -z "$(echo "$value" | grep -oE "^[1-9]{1}[0-9]{0,2}\.([0-9]{1,3}\.){2}[1-9]{1}[0-9]{0,2}$")" ]; then
+  valid_limit="[ip address]"
+ elif [ "$mode" = "DOCKER_LOGSIZE" ] && [ -z "$(echo "$value" | grep -oE "^[1-9]{1}[0-9]{0,2}[mg]$")" ]; then
+  valid_limit="[number < 1000](m|g)"
+ else
+  if [ -z "$(echo "$value" | grep -oE "^(true|false)$")" ]; then
+   valid_limit="true|false"
+  fi
+ fi
+ if [ -n "$valid_limit" ]; then
+  echo "[Error] You can set ${mode} within these values (${valid_limit})"
+  return 1
+ fi
+
+ if cat "$EDOCKER_CONFIG" | grep -q "^${mode}=\"${value}\"$"; then
+  echo "[Info] configuration is same"
+  return 0
+ fi
+
+ sed -i -r "s/^${mode}=.*/${mode}=\"${value}\"/" "$EDOCKER_CONFIG"
+ echo "[Info] configuration has been changed"
+ cat "$EDOCKER_CONFIG"
+
+ return 0
+}
+
+validate_gateway() {
+ local p=($(echo "$DOCKER_GATEWAY" | tr "." " "))
+ ip route | egrep -v "(via|docker0)" | grep -q "${p[0]}.${p[1]}.${p[2]}." || return 0
+
+ local f="false"
+ local s="${p[2]}"
+ for i in $([[ "$s" -lt "30" ]] && seq $((s+1)) $(($s+30)) | xargs || seq $((s-1)) -1 $(($s-30)) | xargs); do
+  if ! ip route | egrep -v "(via|docker0)" | grep -q "${p[0]}.${p[1]}.${i}."; then
+   f="true"
+   DOCKER_GATEWAY="${p[0]}.${p[1]}.${i}.1"
+   break
+  fi
+ done
+
+ if [ "$f" = "true" ]; then
+  echo "[Info] The Dokcer gateway ip has been changed to $DOCKER_GATEWAY due to confliction"
+ else
+  echo "[Info] The Dokcer gateway ip conflict to other ip subnet. You should check it manually"
+ fi
+
+ return 0
+}
+
+load_config() {
+ if [ -f "$EDOCKER_CONFIG" ]; then
+  source "$EDOCKER_CONFIG"
+ fi
+
+ if [ -z "$(echo "${DOCKER_GATEWAY}" | grep -oE "^[1-9]{1}[0-9]{0,2}\.([0-9]{1,3}\.){2}[1-9]{1}[0-9]{0,2}$")" ]; then
+  DOCKER_GATEWAY="10.10.124.1"
+ fi
+ validate_gateway
+
+ if [ -z "$(echo "${DOCKER_LOGSIZE}" | grep -oE "^[1-9]{1}[0-9]{0,2}[mg]$")" ]; then
+  DOCKER_LOGSIZE="2m"
+ fi
+
+ if [ -z "$(echo "${DOCKER_IPV6}" | grep -oE "^(true|false)$")" ]; then
+  DOCKER_IPV6="false"
+ fi
+
+ if [ -z "$(echo "${DOCKER_IPTABLES}" | grep -oE "^(true|false)$")" ]; then
+  DOCKER_IPTABLES="true"
+ fi
+
+ if [ -z "$(echo "${DOCKER_NAT}" | grep -oE "^(true|false)$")" ]; then
+  DOCKER_NAT="true"
+ fi
+
+read -r -d '' edocker_conf <<-EOL || true
+DOCKER_GATEWAY="${DOCKER_GATEWAY}"
+DOCKER_LOGSIZE="${DOCKER_LOGSIZE}"
+DOCKER_IPV6="${DOCKER_IPV6}"
+DOCKER_IPTABLES="${DOCKER_IPTABLES}"
+DOCKER_NAT="${DOCKER_NAT}"
+EOL
+
+ if [ "$(cat ${EDOCKER_CONFIG} 2>/dev/null)" != "${edocker_conf}" ]; then
+  echo "${edocker_conf}" > "${EDOCKER_CONFIG}"
+ fi
+
+ return 0
+}
+
+init_check() {
+ if [ ! -d /etc/apt ]; then
+  echo "Not supported platform"
+  exit 1
+ fi
+
+ if [ $(id -u) -ne 0 ]; then
+  echo "Please run as root"
+  exit 1
+ fi
+
+ if [ ! -d "${EDOCKER_PATH}" ]; then
+  mkdir -p "${EDOCKER_PATH}"
+ fi
+
+ load_config
+ return 0
+}
+
+status() {
+ local config=$(cat "${EDOCKER_CONFIG}" 2>/dev/null)
+ local docker_daemon=$(cat "${DOCKER_PATH}/daemon.json" 2>/dev/null)
+ local i_ver="$(get_version)"
+ if [ -z "$i_ver" ]; then
+  i_ver="not installed"
+ fi
+ local c_ver=$(apt-cache policy "docker-ce" | grep "Candidate:" | head -1 | awk '{ split($2,v,"-"); print v[1]; }' | xargs | sed -r -e "s/.*\://" -e "s/(\-|\+|\~).*//")
+ local status=$(systemctl status docker >/dev/null 2>&1 && echo "active running" || echo "stopped or error")
+
+ local docker_stat=()
+ if exists docker; then
+  docker_stat+=("$(docker ps --format "{{.Names}}")") #running_containers
+  docker_stat+=("$(docker ps --format "{{.Names}}" -f "status=exited")") #stopped_containers
+  docker_stat+=("$(docker images -a --format "{{.Repository}}:{{.Tag}}")") #pulled_images
+  docker_stat+=("$(docker images -f dangling=true --format "{{.Repository}}:{{.Tag}}")") #dangling_images
+  docker_stat+=("$(docker network ls | head -n -3)") #network_list
+ fi
+ for i in $(seq 0 $((${#docker_stat[@]}-1))); do
+  [ -z "${docker_stat[$i]}" ] && docker_stat[$i]="none"
+ done
+
+printf "
+[Ellucy docker status report]
+
+1. Installation:
+  - module: docker-ce
+  - installed: %s
+  - candidate: %s
+
+2. docker Config:
+%s
+
+- docker-daemon.json
+%s
+
+3. Status: %s
+
+4. Containers:
+(1) Active
+%s
+
+(2) Stopped
+%s
+
+5. Images:
+(1) Pulled
+%s
+
+(2) Dangling
+%s
+
+6. Networks
+%s
+
+" "${i_ver}" "${c_ver}" "${config}" "${docker_daemon}" "$status" "${docker_stat[0]}" "${docker_stat[1]}" "${docker_stat[2]}" "${docker_stat[3]}" "${docker_stat[4]}"
+
+ return 0
+}
+
+help() {
+echo "Ellucy docker Helper $VERSION
+Copyright: Jack Nam(jacknam@ellucy.com)
+
+Commands:
+install, upgrade       install/upgrade docker-ce
+set                    set docker-daemon config
+update                 update and restart docker with docker-daemon config
+reset                  reset docker removing all containers, images and netwokrs no matter active or not
+clean                  remove all stopped/unsed/dangling containers, images and netwokrs
+status                 print edocker status and config
+create_network         create a docker bridge network for containers
+
+Usage: edocker COMMAND
+"
+ return 0
+}
+
+init_check
+case "$command" in
+ install)
+  install_docker
+  ;;
+ upgrade)
+  install_docker
+  ;;
+ set)
+  set_config
+  ;;
+ update)
+  set_docker
+  ;;
+ clean)
+  clean_docker
+  ;;
+ reset)
+  reset_docker
+  ;;
+ create_network)
+  create_network
+  ;;
+ status)
+  status
+  ;;
+ help)
+  help
+  ;;
+ *)
+  echo "Error: Command not found. (please refer to help. edocker help)"
+esac
+
+exit 0

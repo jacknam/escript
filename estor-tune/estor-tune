@@ -1,0 +1,892 @@
+#!/bin/bash
+#
+# developed by jacknam@ellucy.com
+#
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin:/usr/local/sbin
+cmd="$1"
+VERSION=0.1
+MLNXTOOL_VER=5.1.3
+TUNE_PATH="/opt/ellucy/estor/tune"
+LOG_FILE="${TUNE_PATH}/tune.log"
+CONF_FILE="${TUNE_PATH}/tune.conf"
+OPER_MODE=
+
+exists() {
+ command -v "$1" >/dev/null 2>&1
+}
+
+logging() {
+ if [ -z "$1" ] || [ -z "$2" ]; then
+  return 1
+ fi
+
+ local target=""
+ case "$1" in
+ e)
+ target="ERROR"
+ ;;
+ i)
+ target="INFO"
+ ;;
+ o)
+ target="OPER"
+ ;;
+ w)
+ target="WARN"
+ ;;
+ *)
+  return 1
+ esac
+
+ local log="$(date '+%F %T') [$target] $2"
+ if [ "$OPER_MODE" = "quiet" ]; then
+  echo -e "$log" >> "$LOG_FILE"
+ else
+  echo -e "$log" | tee -a "$LOG_FILE"
+ fi
+
+ local log_limit=5000
+ local log_count=$(wc -l < "$LOG_FILE" | xargs)
+ if [ "$log_count" -gt "$log_limit" ]; then
+  tail "-$(($log_limit / 2))" "$LOG_FILE" > "${LOG_FILE}.tmp"
+  mv "${LOG_FILE}.tmp" "$LOG_FILE"
+ fi
+
+ return 0
+}
+
+cpu_freq() {
+ local target=$(echo "$1" | grep -oE "(max|cur)")
+ [ -z "$target" ] && return 1
+
+ local freqs=$(cat /sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_${target}_freq 2>/dev/null)
+ if [ -z "$freqs" ]; then
+  echo "-"
+  return 1
+ fi
+ echo "$freqs" | awk 'function aaf(n) {r="";cmd="numfmt --to=si --format \"%.2f\" "n;cmd | getline r;close(cmd);sub(".0","",r);return r"Hz";} \
+ {s+=$1;c+=1;} END { a=int(s/c*1000); print aaf(a); }'
+
+ return 0
+}
+
+cpu_info() {
+ [ "$OPER_MODE" = "quiet" ] && return 0
+
+ local cur_gov=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | uniq | xargs)
+ local max_freq=$(cpu_freq max)
+ local cur_freq=$(cpu_freq cur)
+
+ echo "Current Governor: $cur_gov"
+ echo "Max. Frequency: $max_freq"
+ echo "Current Frequency: $cur_freq"
+ echo
+
+ return 0
+}
+
+cpu_tune() {
+ local types="performance|powersave|userspace|ondemand|conservative|schedutil"
+ local target=$(echo "$1" | grep -oE "^(${types})$")
+
+ local cur_gov=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | uniq | head -1 | xargs)
+ if [ -z "$cur_gov" ]; then
+  logging e "CPU scaling not supported"
+  return 1
+ fi
+
+ cpu_info
+
+ local dflt_gov=$(cat "$TUNE_PATH/.cpu_gov" 2>/dev/null | xargs)
+ local option=""
+ local filter=""
+ local confirm=""
+ if [ -z "$target" ]; then
+  [ "$OPER_MODE" = "quiet" ] && return 1
+
+  local list=$(echo "$types" | tr '|' '\n')
+  option="[number/(c)ancel]: "
+  filter="^([0-9]*|c)$"
+  confirm="> Please type a number of target to set"
+  [ -n "$dflt_gov" ] && confirm+=" (Default: ${dflt_gov})"
+  echo "* CPU governor target list"
+  local number=0
+  while read -r line; do
+   (( number++ ))
+   echo "[$number] $line"
+  done <<< "$list"
+
+  echo -n -e "\n$confirm $option"
+  local answer=""
+  while [ -z "$answer" ]; do
+   read answer
+   answer=$(echo "$answer" | egrep "$filter")
+   if [ -n "$answer" ] && [ "$answer" != "c" ]; then
+    target=$(echo "$list" | sed -n "${answer}"p 2>/dev/null)
+    if [ -z "$target" ]; then
+     answer=""
+    fi
+   fi
+   if [ -z "$answer" ]; then
+    target=""
+    echo -n "> Please enter a valid option $option"
+   fi
+  done
+  if [ "$answer" = "c" ]; then
+   echo "> CPU tune has been cancelled"
+   return 1
+  fi
+ fi
+
+ if [ "$OPER_MODE" != "quiet" ]; then
+  option="[(y)es/(n)o]: "
+  confirm="> Would you like to set [${target}] as CPU governor?"
+  answer=""
+  echo -n "$confirm $option"
+  read answer
+  if [ "$answer" != "y" ]; then
+   echo "> CPU tune has been cancelled"
+   return 1
+  fi
+ fi
+
+ logging o "Changing CPU scaling governor to ${target}"
+
+ if [ "$target" = "$cur_gov" ]; then
+  logging w "the target governor($target) is same as current governor, so cancelled"
+  return 1
+ fi
+
+ local result=$(echo ${target} | tee /sys/devices/system/cpu/cpufreq/policy*/scaling_governor)
+ if [ "$result" != "$target" ]; then
+  logging e "failed to set CPU governor as ${target}"
+  return 1
+ fi
+
+ logging i "CPU scaling governor has been changed from ${cur_gov} to ${target}"
+
+ sleep 1; cpu_info
+
+ return 0
+}
+
+cpu_performance() {
+ local target=$(echo "$1" | grep -oE "^(enable|disable)$")
+ [ -z "$target" ] && return 1
+
+ local types="performance|powersave|userspace|ondemand|conservative|schedutil"
+ local target=$(echo "$1" | grep -oE "^(${types})$")
+
+ local cur_gov=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | uniq | head -1 | xargs)
+ [ -z "$cur_gov" ] && return 1
+ echo "$types" | grep -q "$cur_gov" || return 1
+
+ local gov_file="$TUNE_PATH/.cpu_gov"
+ if [ "$target" = "disable" ]; then
+  local ex_gov=$(cat "$gov_file" 2>/dev/null | xargs)
+  [ -z "$ex_gov" ] && return 1
+  echo "$types" | grep -q "$ex_gov" || return 1
+
+  if echo "$ex_gov" | tee /sys/devices/system/cpu/cpufreq/policy*/scaling_governor >/dev/null 2>&1; then
+   logging i "The startup setup for CPU governor to performance is disabled"
+  fi
+ else
+  [ "$cur_gov" = "performance" ] && return 0
+  echo "$cur_gov" > "$gov_file"
+  if echo performance | tee /sys/devices/system/cpu/cpufreq/policy*/scaling_governor >/dev/null 2>&1; then
+   logging i "The startup setup for CPU governor to performance has been done"
+  fi
+ fi
+
+ return 0
+}
+
+sysctl_network() {
+ local sysctl_file="/etc/sysctl.conf"
+ local cur_set=$(cat "$sysctl_file" 2>/dev/null | grep -E "^#estor-tune-[1-9].*G" | sed 's/#estor-tune-//')
+ [ -z "$cur_set" ] && cur_set="None"
+
+ if [ "$OPER_MODE" != "quiet" ]; then
+  echo "Current Network Tune Setting: $cur_set"; echo
+ fi
+
+ local action=$(echo "$1" | grep -oE "(enable|disable)")
+ [ -z "$action" ] && return 1
+
+ local option=""
+ local confirm=""
+ local answer=""
+ local filter=""
+
+ if [ "$action" = "disable" ]; then
+  if [ "$OPER_MODE" != "quiet" ]; then
+   option="[(y)es/(n)o]: "
+   confirm="> Would you like to disable network tuning?"
+   answer=""
+   echo -n "$confirm $option"
+   read answer
+   if [ "$answer" != "y" ]; then
+    echo "> Sysctl network tune disable has been cancelled"
+    return 1
+   fi
+  fi
+
+  if grep -q "^#estor-tune" "$sysctl_file"; then
+   sed -i -n '/^#estor-tune-start/,/^#estor-tune-end/!p' "$sysctl_file"
+  fi
+
+  logging i "Sysctl network tune has been disabled"
+  return 0
+ fi
+
+ local types="1G|10G|40G+"
+ local target=
+ if [ "$OPER_MODE" = "quiet" ]; then
+  target=$(echo "$2" | grep -oE "(${types})")
+ else
+  local list=$(echo "$types" | tr '|' '\n')
+  option="[number/(c)ancel]: "
+  filter="^([0-9]*|c)$"
+  confirm="> Please type a number of target to set"
+  echo "* Network tune speed target list"
+  local number=0
+  while read -r line; do
+   (( number++ ))
+   echo "[$number] $line"
+  done <<< "$list"
+
+  echo -n -e "\n$confirm $option"
+  answer=""
+  while [ -z "$answer" ]; do
+   read answer
+   answer=$(echo "$answer" | egrep "$filter")
+   if [ -n "$answer" ] && [ "$answer" != "c" ]; then
+    target=$(echo "$list" | sed -n "${answer}"p 2>/dev/null)
+    if [ -z "$target" ]; then
+     answer=""
+    fi
+   fi
+   if [ -z "$answer" ]; then
+    target=""
+    echo -n "> Please enter a valid option $option"
+   fi
+  done
+
+  if [ "$answer" = "c" ]; then
+   echo "> Sysctl network tune has been cancelled"
+   return 1
+  fi
+
+  option="[(y)es/(n)o]: "
+  confirm="> Would you like to set tuning for [${target}]?"
+  answer=""
+  echo -n "$confirm $option"
+  read answer
+  if [ "$answer" != "y" ]; then
+   echo "> Sysctl network tune has been cancelled"
+   return 1
+  fi
+ fi
+
+ if [ -z "$target" ]; then
+  logging e "No network type defined"
+  return 1
+ fi
+
+ logging o "Setting up Sysctl network tune for ${target}"
+ if grep -q "^#estor-tune-${target}" "$sysctl_file"; then
+  logging w "Sysctl network tune for ${target} is already set, so cancelled"
+  return 1
+ fi
+
+ local conf="#estor-tune-start
+#net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_timestamps=0
+net.ipv4.tcp_sack=1
+net.core.netdev_max_backlog=250000
+net.ipv4.tcp_low_latency=1
+net.ipv4.tcp_adv_win_scale=1
+net.core.default_qdisc=fq
+net.ipv4.conf.all.arp_announce=2
+net.ipv4.conf.all.arp_filter=1
+net.ipv4.conf.all.arp_ignore=1
+net.ipv4.conf.default.arp_filter=1
+net.ipv4.tcp_congestion_control=htcp
+net.ipv4.tcp_no_metrics_save=1
+#estor-tune-${target}
+"
+
+case "$target" in
+ 1G)
+  conf+="net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.core.optmem_max=67108864
+net.core.rmem_default=268435456
+net.core.wmem_default=268435456
+net.ipv4.tcp_rmem=4096 87380 33554432
+net.ipv4.tcp_wmem=4096 65536 33554432
+"
+  ;;
+ 10G)
+  conf+="net.core.rmem_max=268435456
+net.core.wmem_max=268435456
+net.core.optmem_max=268435456
+net.core.rmem_default=134217728
+net.core.wmem_default=134217728
+net.ipv4.tcp_rmem=4096 87380 134217728
+net.ipv4.tcp_wmem=4096 65536 134217728
+"
+  ;;
+ 40G+)
+  conf+="net.core.rmem_max=536870912
+net.core.wmem_max=536870912
+net.core.optmem_max=536870912
+net.core.rmem_default=268435456
+net.core.wmem_default=268435456
+net.ipv4.tcp_rmem=4096 87380 268435456
+net.ipv4.tcp_wmem=4096 65536 268435456
+"
+  ;;
+ *)
+  logging e "Not Supported for $target"
+  return 1
+esac
+ conf+="#estor-tune-end"
+ conf=$(sed -n '/^#estor-tune-start/,/^#estor-tune-end/!p' "$sysctl_file")"\n\n$conf"
+ echo -e "$conf" > "$sysctl_file"
+
+ if [ "$OPER_MODE" = "quiet" ]; then
+  sysctl -p > /dev/null 2>&1
+ else
+  echo; sysctl -p; echo
+ fi
+
+ logging i "Sysctl network tune for ${target} has been set at $sysctl_file"
+
+ return 0
+}
+
+ofed_tools() {
+ if [ ! -f "/opt/ellucy/infiniband/mlnx-tools-${MLNXTOOL_VER}/ofed_scripts/set_irq_affinity_bynode.sh" ]; then
+  if ! exists wget; then
+   if ! apt install -y wget; then
+    echo "> wget is required"
+    return 1
+   fi
+  fi
+
+  if ! exists tar; then
+   if ! apt install -y tar; then
+    echo "> tar is required"
+    return 1
+   fi
+  fi
+
+  mkdir -p /opt/ellucy/infiniband
+  if wget -O /opt/ellucy/infiniband/v${MLNXTOOL_VER}.tar.gz https://github.com/Mellanox/mlnx-tools/archive/refs/tags/v${MLNXTOOL_VER}.tar.gz; then
+   tar -xzf /opt/ellucy/infiniband/v${MLNXTOOL_VER}.tar.gz -C /opt/ellucy/infiniband 2>/dev/null
+   chmod +x /opt/ellucy/infiniband/mlnx-tools-${MLNXTOOL_VER}/ofed_scripts/*
+  fi
+ fi
+
+  [ ! -f "/opt/ellucy/infiniband/mlnx-tools-${MLNXTOOL_VER}/ofed_scripts/set_irq_affinity_bynode.sh" ] && return 1
+
+ return 0
+}
+
+irq_affinity() {
+ local action="$1"
+ local numa_nodes=$(ls /sys/class/net/*/device/numa_node 2>/dev/null)
+ local numa_support="N"
+ if [ ! -z "$numa_nodes" ]; then
+  if ! cat $numa_nodes | grep -q "-"; then
+   numa_support="Y"
+  fi
+ fi
+
+ if [ "$numa_support" != "Y" ]; then
+  logging e "System NUMA not supported or disabled, Please check your system and try again"
+  return 1
+ fi
+
+ if ! ofed_tools; then
+  logging e "Required Mellanox Tools are not installed"
+  return 1
+ fi
+
+ local target_nics=
+ local script_path="/opt/ellucy/infiniband/mlnx-tools-${MLNXTOOL_VER}/ofed_scripts"
+ cd "$script_path"
+
+ if [ "$ETH_IRQ" = "Y" ]; then
+  target_nics=$(echo "$numa_nodes" | cut -d/ -f5)
+ else
+  target_nics=$(${script_path}/ibdev2netdev 2>/dev/null | awk '{ print $5; }')
+ fi
+ if [ -z "$target_nics" ]; then
+  logging e "No nic found for irq affinity"
+  return 1
+ fi
+
+ if [ "$action" = "show" ]; then
+  while read -r nic; do
+   echo "> IRQ Affinity for $nic"
+   bash ${script_path}/show_irq_affinity.sh $nic 2>/dev/null | xargs
+   echo
+  done <<< "$target_nics"
+  return 0
+ fi
+
+ if ! grep -iqE "(debian|ubuntu)" /etc/*-release; then
+  if [ "$(systemctl is-active irqbalance 2>/dev/null)" = "active" ]; then
+   systemctl stop irqbalance
+  fi
+ fi
+
+ while read -r line; do
+  numa=$(cat ${line})
+  [ "$numa" -lt "0" ] && continue
+  nic=$(echo "$line" | cut -d/ -f5)
+  echo "$target_nics" | grep -q "$nic" || continue
+
+  result=$(bash ${script_path}/set_irq_affinity_bynode.sh $numa $nic 2>/dev/null)
+  if echo "$result" | grep -q "done"; then
+   logging i "Optimization IRQ for $nic has been done with numa node $numa"
+  else
+   logging e "Failed to set IRQ Optimization to $nic"
+  fi
+ done <<< "$numa_nodes"
+
+ return 0
+}
+
+mr_cache() {
+ local mr_devs=$(ls /sys/class/infiniband/*/device/physfn 2>/dev/null)
+ if [ -z "$mr_devs" ]; then
+  logging e "No infiniband device found for mr cache"
+  return 1
+ fi
+ mr_devs=$(echo "$mr_devs" | cut -d/ -f5)
+
+ if ! ofed_tools; then
+  logging e "Required Mellanox Tools are not installed"
+  return 1
+ fi
+
+ local script_path="/opt/ellucy/infiniband/mlnx-tools-${MLNXTOOL_VER}/ofed_scripts"
+ cd "$script_path"
+
+ while read -r dev; do
+  logging o "MR Cache for $dev"
+  bash ${script_path}/setup_mr_cache.sh $dev
+  echo
+ done <<< "$mr_devs"
+
+ return 0
+}
+
+eth_tune() {
+ local action="$1"
+ if ! exists ethtool; then
+  if ! apt install -y ethtool; then
+   logging e "ethtool is required"
+   return 1
+  fi
+ fi
+
+ if ! ofed_tools; then
+  logging e "Required Mellanox Tools are not installed"
+  return 1
+ fi
+
+ local ip_link=$(ip -o link)
+ local script_path="/opt/ellucy/infiniband/mlnx-tools-${MLNXTOOL_VER}/ofed_scripts"
+ cd "$script_path"
+
+ local target_nics=$(${script_path}/ibdev2netdev 2>/dev/null | awk '{ print $5; }')
+ while read -r nic; do
+  if echo "$ip_link" | grep -q ": ${nic}: .*link/ether"; then
+   if [ "$action" = "show" ]; then
+    echo "> Tuning Parameters"
+    ethtool -c ${nic}
+    continue
+   fi
+
+   if ethtool -C ${nic} adaptive-rx off rx-usecs 0 tx-frames 64 2>/dev/null; then
+    logging i "Ethernet tuning for ${nic} has been done"
+   else
+    logging e "Failed to set ethernet tuning parameters for ${nic}"
+   fi
+  fi
+ done <<< "$target_nics"
+
+ return 0
+}
+
+memlock_tune() {
+ local limit_file="/etc/security/limits.d/estor-tune.conf"
+ local cur_set=$([ -f "$limit_file" ] && echo "Y" || echo "N")
+ [ "$OPER_MODE" != "quiet" ] && echo "Current Memory Limit Unlimited: $cur_set"
+
+ local action=$(echo "$1" | grep -oE "(enable|disable)")
+ [ -z "$action" ] && return 1
+
+ if [ "$OPER_MODE" != "quiet" ]; then
+  local answer=""
+  echo -n "> Would you like to ${action} tuning for memory lock unlimited? [(y)es/(n)o]: "
+  read answer
+  if [ "$answer" != "y" ]; then
+   echo "> ${action} memlock tuning cancelled"
+   return 1
+  fi
+ fi
+
+ if [ "$action" = "enable" ]; then
+  if [ "$cur_set" = "N" ]; then
+cat > "$limit_file" <<EOF
+* soft memlock unlimited
+* hard memlock unlimited
+EOF
+  fi
+ else
+   if [ "$cur_set" = "Y" ]; then
+    rm -f "$cur_set"
+   fi
+ fi
+
+ logging i "${action} memory limit unlimited has been done"
+
+ return 0
+}
+
+set_systemd() {
+ local action=$(echo "$1" | grep -oE "^(set|remove)$")
+ [ -z "$action" ] && return 1
+
+ local reload=""
+ local srv_file="/etc/systemd/system/estor-tune.service"
+
+ if [ "$action" = "set" ]; then
+  if [ -f "$srv_file" ]; then
+   if [ "${@:$#}" = "f" ]; then
+    reload="Y"
+   fi
+  else
+   reload="Y"
+  fi
+
+  if [ "$reload" = "Y" ]; then
+   local estor_tune_exe=$(which estor-tune 2>/dev/null)
+   if [ -z "$estor_tune_exe" ]; then
+    logging e "estor-tune is not registered as executable binary"
+    return 1
+   fi
+
+cat > "$srv_file" <<EOF
+[Unit]
+Description=Ellucy ESTOR Tune Service
+Wants=network-online.target
+After=network.target network-online.target
+Requires=network.target
+
+[Service]
+Type=oneshot
+ExecStart=${estor_tune_exe} startup
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+   chmod 664 "$srv_file"
+   systemctl enable estor-tune.service
+   systemctl start estor-tune.service
+  fi
+ else
+  if [ -f "$srv_file" ]; then
+   rm -f "$srv_file"
+   reload="Y"
+  fi
+ fi
+
+ if [ "$reload" = "Y" ]; then
+  systemctl daemon-reload
+ fi
+
+ return 0
+}
+
+tune_startup() {
+ local action=$(echo "$1" | grep -oE "(enable|disable)")
+ local target=$(echo "$2" | grep -oE "(cpu|irqaffinity|mrcache|ethtune|all)")
+ if [ -z "$action" ] || [ -z "$target" ]; then
+  return 1
+ fi
+
+ local cur_conf=$(echo "$STARTUP_TUNE" | sed 's/\s\+/\n/g')
+ local new_conf=$(echo "$cur_conf" | grep -vE "($target|none)" | xargs)
+
+ if [ "$action" = "enable" ]; then
+  if [ "$target" = "all" ]; then
+   new_conf="cpu irqaffinity mrcache ethtune"
+  else
+   new_conf+=" $target"
+   new_conf=$(echo "$new_conf" | xargs)
+  fi
+  set_systemd set
+ elif [ "$action" = "disable" ]; then
+  if [ -z "$new_conf" ] || [ "$target" = "all" ]; then
+   set_systemd remove
+   new_conf="none"
+  fi
+ fi
+
+ set_conf startup_tune "$new_conf" system
+ logging i "Startup tuning for ${target} is ${action}ed (Current startup tuning: $STARTUP_TUNE)"
+
+ return 0
+}
+
+startup() {
+ local cur_conf=$(echo "$STARTUP_TUNE" | sed 's/\s\+/\n/g')
+ [ -z "$cur_conf" ] && return 0
+
+ OPER_MODE="quiet"
+
+ if echo "$cur_conf" | grep -q "cpu"; then
+  cpu_performance enable
+ fi
+
+ if echo "$cur_conf" | grep -q "irqaffinity"; then
+  irq_affinity
+ fi
+
+ if echo "$cur_conf" | grep -q "mrcache"; then
+  mr_cache
+ fi
+
+ if echo "$cur_conf" | grep -q "ethtune"; then
+  eth_tune
+ fi
+
+ return 0
+}
+
+tune_all() {
+ local action=$(echo "$1" | grep -oE "(enable|disable)")
+ [ -z "$action" ] && return 1
+
+ local answer=""
+ echo -n "> Would you like to ${action} all tuning for estor? [(y)es/(n)o]: "
+ read answer
+ if [ "$answer" != "y" ]; then
+  echo "> ${action} all tuning for estor cancelled"
+  return 1
+ fi
+
+ logging i "${action} tuning all setting"
+
+ cpu_performance "$action"
+ sysctl_network "$action"
+ memlock_tune "$action"
+ tune_startup "$action" all
+
+ if [ "$action" = "enable" ]; then
+  irq_affinity performance
+  mr_cache
+  eth_tune
+ fi
+
+ logging i "Tuning all has been ${action}ed"
+ echo "* Please reboot"
+
+ return 0
+}
+
+set_conf() {
+ local key="${1^^}"
+ local val="$2"
+ if [ -z "$key" ] || [ -z "$val" ]; then
+  cat "$CONF_FILE" 2>/dev/null
+  return 0
+ fi
+ local system_job=$([ "${@:$#}" = "system" ] && echo "Y" || echo "N")
+
+ if [ "$key" = "STARTUP_TUNE" ]; then
+  if [ "$system_job" != "Y" ]; then
+   echo "> You cannot set STARTUP_TUNE manually"
+   return 1
+  fi
+ fi
+
+ local conf=$(cat "$CONF_FILE" 2>/dev/null | sed "/^${key}=/d")
+ if [ "$val" != "del" ]; then
+  if echo "$val" | grep -qE "^[0-9]+"; then
+   conf="${conf}\n${key}=${val}"
+  else
+   conf="${conf}\n${key}=\"${val}\""
+  fi
+ fi
+
+ if [ "$system_job" = "Y" ]; then
+  echo -e "$conf" > "$CONF_FILE"
+ else
+  echo -e "$conf" | tee "$CONF_FILE"
+ fi
+ source "$CONF_FILE"
+
+ return 0
+}
+
+status_report() {
+ echo "# CPU Status"
+ cpu_info
+
+ local sysctl_file="/etc/sysctl.conf"
+ local sysctl_set=$(cat "$sysctl_file" 2>/dev/null | grep -E "^#estor-tune-[1-9].*G" | sed 's/#estor-tune-//')
+ [ -z "$sysctl_set" ] && sysctl_set="None"
+
+ local numa_nodes=$(ls /sys/class/net/*/device/numa_node 2>/dev/null)
+ local numa_support="N"
+ if [ ! -z "$numa_nodes" ]; then
+  if ! cat $numa_nodes | grep -q "-"; then
+   numa_support="Y"
+  fi
+ fi
+
+ local limit_file="/etc/security/limits.d/estor-tune.conf"
+ limit_set=$([ -f "$limit_file" ] && echo "Set at ${limit_file}" || echo "Not set")
+
+ local systemd_file="/etc/systemd/system/estor-tune.service"
+ local systemd_set=$([ -f "$systemd_file" ] && echo "Enabled at ${systemd_file}" || echo "Disabled")
+
+ echo "# CPU scaling governor
+> Startup Tuning: ${STARTUP_TUNE}
+
+# Sysctl Network
+> Network Tune Setting: ${sysctl_set}
+
+# IRQ Affinity
+> NUMA Supprot: ${numa_support}
+
+# Memory Lock Unlimited
+> Current Setting: ${limit_set}
+
+# Startup Tuning on Boot
+> Current Setting: ${systemd_set}
+> Enabled Tuning: ${STARTUP_TUNE}
+
+# Mellanox Tools Version: ${MLNXTOOL_VER}
+"
+
+ return 0
+}
+
+tune_help() {
+echo "Ellucy ESTOR Tune $VERSION
+Copyright: Jack Nam (jacknam@ellucy.com)
+
+Required:
+wget, tar, ethtool, irqbalance, ofed_scripts
+
+Reference:
+Config File  : $CONF_FILE
+Log File     : $LOG_FILE
+OFED Path    : /opt/ellucy/infiniband/mlnx-tools-${MLNXTOOL_VER}/ofed_scripts
+Systemd File : /etc/systemd/system/estor-tune.service
+
+Configs:
+$(cat $CONF_FILE)
+
+Commands:
+*options: (performance|powersave|userspace|ondemand|conservative|schedutil)
+cputune (*options)              set CPU scaling governor
+sysctlnetwork (enable|disable)  set network tuning config to /etc/sysctl.conf
+memlocktune (enable|disable)    set memory lock unlimited
+irqaffinity (show|none)         set IRQ affinity for network devices (Infiniband or All Ethernet)
+mrcache                         set MR cahce for infiniband devices
+ethtune                         set tuning params for ethernet devices using ethtool
+tuneall (enable|disable)        enable or disable all tuning packages (require reboot)
+tunestartup (enable|disable) (irqaffinity|mrcache|ethtune|all) set startup tuning service on booting
+set (none|key) (val|del)        set config 'key=val' to Config (if del, then remove)
+status                          show current tune status
+help                            help usage
+"
+
+ return 0
+}
+
+init() {
+ if ! exists irqbalance; then
+  if apt install -y irqbalance; then
+   system enable irqbalance
+  fi
+ fi
+
+ if [ ! -d "$TUNE_PATH" ]; then
+  mkdir -p "$TUNE_PATH"
+ fi
+
+ if [ ! -f "$CONF_FILE" ]; then
+cat > "$CONF_FILE" <<EOF
+ETH_IRQ="N"
+STARTUP_TUNE="none"
+EOF
+ fi
+
+ source "$CONF_FILE"
+
+ return 0
+}
+
+if ! init; then
+ exit 1
+fi
+
+case "$cmd" in
+ cputune)
+  cpu_tune "${@:2}"
+  ;;
+ sysctlnetwork)
+  sysctl_network "${@:2}"
+  ;;
+ memlocktune)
+  memlock_tune "${@:2}"
+  ;;
+ irqaffinity)
+  irq_affinity "${@:2}"
+  ;;
+ mrcache)
+  mr_cache "${@:2}"
+  ;;
+ ethtune)
+  eth_tune "${@:2}"
+  ;;
+ tuneall)
+  tune_all "${@:2}"
+  ;;
+ tunestartup)
+  tune_startup "${@:2}"
+  ;;
+ startup)
+  startup
+  ;;
+ set)
+  set_conf "${@:2}"
+  ;;
+ status)
+  status_report
+  ;;
+ help)
+  tune_help
+  ;;
+ *)
+  if [ -z "$cmd" ]; then
+   echo "Ellucy ESTOR TUNE $VERSION"
+  else
+   echo "Ellucy ESTOR TUNE $VERSION"
+   tune_help
+  fi
+esac
+
+exit 0

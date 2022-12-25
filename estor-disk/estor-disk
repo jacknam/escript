@@ -1,0 +1,1638 @@
+#!/bin/bash
+#
+# developed by jacknam@ellucy.com
+#
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin:/usr/local/sbin
+command="$1"
+VERSION=0.1
+
+exists() {
+ command -v "$1" >/dev/null 2>&1
+}
+
+action_confirm() {
+ confirm_answer=""
+ local confirm="$1"
+ local list=""
+ local option=""
+ local filter=""
+
+ if [ -z "$2" ]; then
+  option="[(y)es/(n)o]: "
+  filter="^(y|n)$"
+ elif [ "$2" = "quit" ]; then
+  option="[(y)es/(n)o/(q)uit]: "
+  filter="^(y|n|q)$"
+ elif echo "$2" | grep -q "^filter:"; then
+  if [ -n "$3" ]; then
+   confirm="[$3] ${confirm}"
+  fi
+  option="[type/(c)ancel]: "
+  filter='^('$(echo "$2" | sed 's/^filter\://')'|c)$'
+ else
+  [ -n "$3" ] && echo -e "\n$3"
+  list=$(echo "$2" | tr '|' '\n')
+  option="[number/(c)ancel]: "
+  filter="^([0-9]+|c)$"
+  local number=0
+  while read -r line; do
+   (( number++ ))
+   echo "[$number] $line"
+  done <<< "$list"
+  echo
+ fi
+
+ echo -n "# ${confirm} ${option}"
+ local answer=""
+ while [ -z "$answer" ]; do
+  read answer
+  answer=$(echo "$answer" | grep -E "$filter")
+  if [ "$answer" = "q" ] || [ "$answer" = "c" ]; then
+   return 1
+  fi
+
+  if [ -n "$answer" -a -n "$list" ]; then
+   answer=$(echo "$list" | sed -n "${answer}"p 2>/dev/null)
+  fi
+
+  if [ -z "$answer" ]; then
+   echo -n "> Please enter a valid option $option"
+  fi
+ done
+ confirm_answer="$answer"
+
+ return 0
+}
+
+table_report() {
+ local in_d=$([ -z "$2" ] && echo "" || echo "-s '$2'")
+ local report=$(echo -e "$1" | column -t ${in_d})
+ [ -z "$report" ] && return 1
+
+ local under_bar=$(printf "\x2D%.0s" $(seq 1 $(echo "$report" | wc -L)))
+ local title=$(echo "$report" | head -1)
+ report=$(echo "$report" | sed '1d')
+
+ printf "%s\n%s\n%s\n%s\n%s\n" "$under_bar" "$title" "$under_bar" "$report" "$under_bar"
+
+ return 0
+}
+
+jq_filter() {
+ local j=""
+ local i=""
+
+ if test -t 0; then
+  j="$1"
+  i="${@:2}"
+ else
+  j="$(cat -)"
+  i="$@"
+ fi
+
+ if [ -z "$j" ] || [ -z "$i" ]; then
+  return 1
+ fi
+ i=$(echo "$i"  | sed 's/|/","/g' | awk '{ print "{\""$0"\"}"; }')
+
+ echo "$j" | jq -c "$i" 2>/dev/null
+ return 0
+}
+
+jq_data() {
+ local t=
+ if test -t 0; then
+  t="$1"
+ else
+  t="$(cat -)"
+ fi
+
+ echo "$t" | sed -r 's/":([0-9]+)/":"\1"/g;s/^\{//;s/\}$//;s/:null/:"-"/g;s/"[^"]*"://g;s/","/|/g;s/"//g;s/ \|/|/g;s/\| /|/g;' | awk '{$1=$1}1'
+ return 0
+}
+
+parse_smart_info() {
+ local smart_log="$1"
+ local return_type="$2"
+ local info_head="Vendor|Model|Serial|Capacity|Sector|Media|RPM|Type"
+
+ if [ "$smart_log" = "header" ]; then
+  echo "$info_head"
+  return 0
+ fi
+ [ -z "$smart_log" ] && return 1
+
+ local v=""
+ local info_data=$(echo "$smart_log" | sed -n '/^=== START OF INFORMATION SECTION ===/{:a;N;/^$/M!ba;p}')
+ local info_row=()
+ local info_ids="device_model|vendor serial_number user_capacity sector_size|block_size rotation_rate sata_version|transport_protocol"
+
+ for id in ${info_ids}; do
+  v=""
+  while read line; do
+   v=$(echo "$info_data" | grep -i "$(echo "$line" | sed 's/_/ /g')" | cut -d":" -f2 | xargs)
+   sid="$line"
+   [ -n "$v" ] && break
+  done <<< "$(echo "$id" | tr '|' '\n')"
+
+  if [ "$sid" = "device_model" ] || [ "$sid" = "vendor" ]; then
+   if [ -z "$v" ]; then
+    info_row+=("-")
+    info_row+=("-")
+   else
+    v=$(echo "$v" | sed 's/ /_/g')
+    if [ "$sid" = "vendor" ]; then
+     info_row+=("$v")
+     v=$(echo "$info_data" | grep -i "product:" | cut -d":" -f2 | xargs | sed 's/ /_/g')
+    else
+     info_row+=("$(echo "$v" | cut -d"_" -f1)")
+     v=$(echo "$v" | cut -d"_" -f2-)
+    fi
+    info_row+=("${v:--}")
+   fi
+   continue
+  fi
+
+  if [ -n "$v" ]; then
+   if [[ "$id" = *"user_capacity"* ]]; then
+    v=$(echo "$v" | cut -d"[" -f2 | sed 's/\]//;s/ //g')
+   elif [[ "$id" = *"sector_size"* ]]; then
+    v=$(echo "$v" | cut -d" " -f1)
+   elif [[ "$id" = *"rotation_rate"* ]]; then
+    if echo "$v" | grep -qi "rpm"; then
+     v=$(echo "$v" | awk '{ print $1; }')
+     info_row+=("HDD")
+     info_row+=("$v")
+    else
+     if echo "$info_data" | grep -qi "solid state"; then
+      info_row+=("SSD")
+      info_row+=("-")
+     else
+      info_row+=("-")
+      info_row+=("-")
+     fi
+    fi
+    continue
+   elif [[ "$id" = *"sata_version"* ]]; then
+    v=$(echo "$v" | cut -d" " -f1)
+   fi
+  fi
+  info_row+=("${v:--}")
+ done
+
+ local result=""
+ for (( i=0; i<${#info_row[@]}; i++ )); do
+  result+="|${info_row[i]}"
+ done
+
+ echo "${result:1}"
+
+ return 0
+}
+
+parse_smart_status() {
+ local smart_log="$1"
+ local disk_type="$2"
+ local status_head="TEMP|HOUR|CRC|LIFE|TEST|RS(RU)|PS(WU)|OU(VU)|SR(RRW)|HEALTH"
+
+ if [ "$smart_log" = "header" ]; then
+  echo "$status_head"
+  return 0
+ fi
+
+ if [ -z "$smart_log" ] || [ -z "$disk_type" ]; then
+  return 1
+ fi
+
+ local ref_row=()
+ local ref_ids=""
+ local ref_data=""
+
+ local error_row=()
+ local error_ids=""
+ local error_data=""
+ local error_cnt=0
+ local v=""
+
+ if [ "$disk_type" = "SATA" ]; then
+  ref_ids="0xc2|0xbe 0x09 0xc7 0xb1|0x09|0xf1"
+  ref_data=$(echo "$smart_log" | sed -n '/^Vendor Specific SMART Attributes/{:a;N;/^$/M!ba;p}' | grep "^0x" | sed 's/(.*)//g' | awk '{ print $1,$4,$NF; }')
+  for id in ${ref_ids}; do
+   v=""
+   while read line; do
+    if [ "$id" = "0xb1|0x09|0xf1" ]; then
+     v=$(echo "$ref_data" | grep "^$line" | awk '{ print $(NF-1); }' | sed 's/^0//')
+    else
+     v=$(echo "$ref_data" | grep "^$line" | awk '{ print $NF; }')
+    fi
+    [ -n "$v" ] && break
+   done <<< "$(echo "$id" | tr '|' '\n')"
+   ref_row+=("${v:--}")
+  done
+
+  error_ids="0x05 0xc5 0xc6|0xbb 0x0a"
+  error_data=$(echo "$smart_log" | sed -n '/^Vendor Specific SMART Attributes/{:a;N;/^$/M!ba;p}' | grep "^0" | sed 's/(.*)//g' | awk '{ print $1, $NF; }')
+  for id in ${error_ids}; do
+   v=""
+   while read line; do
+    v=$(echo "$error_data" | grep "^$line" | awk '{ print $NF; }')
+    [ -n "$v" ] && break
+   done <<< "$(echo "$id" | tr '|' '\n')"
+   if echo "$v" | grep -qE "^[0-9]+"; then
+    let "error_cnt+=v"
+   fi
+   error_row+=("${v:--}")
+  done
+ elif [ "$disk_type" = "SAS" ]; then
+  ref_ids="drive temperature|accumulated power on|non-medium error count|load-unload"
+  ref_data=$(echo "$smart_log" | grep -iE "($ref_ids)" | cut -d"[" -f1 | awk -F":" '{ sub(/^[ \t]+/,"",$1); gsub(/ |[[:alpha:]]+/,"",$2); print $1,$2; }')
+
+  while read line; do
+   v=$(echo "$ref_data" | grep -i "$line" | awk '{ print $NF; }')
+   if [ "$line" = "load-unload" ]; then
+    v=($(echo "$v" | xargs))
+    a=$(echo "${v[0]}" | grep -oE "[0-9]+")
+    b=$(echo "${v[1]}" | grep -oE "[0-9]+")
+    if [[ "$a" -gt "0" ]] && [[ "$b" -gt "0" ]]; then
+     v=$(((a-b)*100/a))
+    else
+     v=""
+    fi
+   fi
+   ref_row+=("${v:--}")
+  done <<< "$(echo "$ref_ids" | tr '|' '\n')"
+
+  error_ids="read|write|verify"
+  error_data=$(echo "$smart_log" | sed -n '/^Error counter log/{:a;N;/^$/M!ba;p}' | grep -E "^($error_ids):")
+  local retry=0
+  while read line; do
+   line=($(echo "$error_data" | grep "^${line}:" | cut -d":" -f2 | xargs))
+   v=$(echo "${line[2]}" | grep -oE "^[0-9]+")
+   if [ -n "$v" ]; then
+    let "retry+=v"
+    let "error_cnt+=v"
+   fi
+   v=$(echo "${line[6]}" | grep -oE "^[0-9]+")
+   [ -n "$v" ] && let "error_cnt+=v"
+   error_row+=("${v:--}")
+  done <<< "$(echo "$error_ids" | tr '|' '\n')"
+  error_row+=("$retry")
+ else
+  return 1
+ fi
+
+ local test=$(echo "$smart_log" | grep -i "smart.*health" | awk '{ if ($NF == "PASSED" || $NF == "OK") print "PASS"; else print "FAIL"; }')
+ ref_row+=("${test:--}")
+
+ local health=$([[ "$error_cnt" -gt "0" ]] && echo "BAD" || echo "GOOD")
+ [ "$test" = "FAIL" ] && health="BAD"
+ error_row+=("$health")
+
+ local result=""
+ for (( i=0; i<${#ref_row[@]}; i++ )); do
+  result+="|${ref_row[i]}"
+ done
+ for (( i=0; i<${#error_row[@]}; i++ )); do
+  result+="|${error_row[i]}"
+ done
+
+ echo "${result:1}"
+
+ return 0
+}
+
+get_smart_data() {
+ local dev=$(echo "$1" | grep -oE "^/dev/(sd[a-z]+|bus/[0-9]+)")
+ local did=$(echo "$2" | grep -oE "[0-9]{1,}")
+ local output=$(echo "${@:$#}" | grep -oE -m1 "(check|report)")
+ [ -z "$dev" ] && return 1
+
+ local smart_log=""
+ if [ -z "$did" ]; then
+  smart_log=$(smartctl -s on -f hex,id -x -a ${dev} 2>/dev/null)
+ else
+  smart_log=$(smartctl -s on -f hex,id -x -a -d megaraid,${did} ${dev} 2>/dev/null)
+ fi
+ [ -z "$smart_log" ] && return 1
+
+ local info_row=$(parse_smart_info "$smart_log")
+ local disk_type=$(echo "$info_row" | awk -F"|" '{ print $NF; }')
+ if ! echo "$disk_type" | grep -qE "^(SATA|SAS)$"; then
+  return 1
+ fi
+
+ local status_row=$(parse_smart_status "$smart_log" "$disk_type")
+ local health_check=$(echo "$status_row" | awk -F"|" '{ print $NF; }')
+ local header=""
+ if [ "$output" = "check" ]; then
+  echo "$health_check" | xargs
+ elif [ "$output" = "report" ]; then
+  header="# SMART Report of estor [DID: $did, Device: $dev, Health: $health_check]"
+  local under_bar=$(printf "=%.0s" $(seq 1 ${#header}))
+  echo "$under_bar"
+  echo "$header"
+  echo "$under_bar"
+  echo "(1) Disk Info"
+  header=$(parse_smart_info header)
+  info_row=$(echo -e "${header}\n${info_row}")
+  table_report "$info_row" "|"
+  echo "(2) Disk Status"
+  header=$(parse_smart_status header)
+  status_row=$(echo -e "${header}\n${status_row}")
+  table_report "$status_row" "|"
+ else
+  echo "${info_row}|${status_row}"
+ fi
+
+ return 0
+}
+
+disk_locating() {
+ local dev=$(echo "$1" | grep -m1 -oE "^(/dev/sd[a-z]+|/did/[0-9]+)")
+ [ -z "$dev" ] && return 1
+
+ if echo "$dev" | grep -q "/did/"; then
+  local did=$(echo "$dev" | sed 's#/did/##' | xargs)
+  local devs=$(smartctl --scan | grep "\-d megaraid," | awk '{ split($3,a,","); print $1"|"a[2]; }')
+  dev=$(echo "$devs" | grep "|${did}$" | cut -d"|" -f1)
+  [ -z "$dev" ] && return 1
+  echo "Locating disk megaraid,${did}..."
+  for i in $(seq 1 5); do
+   smartctl -t select,0-10 -C "${dev}" -d megaraid,"${did}" > /dev/null 2>&1
+   sleep 0.5
+  done
+ else
+  [ -z "$(ls $dev 2>/dev/null)" ] && return 1
+  echo "Locating disk ${dev}..."
+  timeout 1s dd if=${dev} of=/dev/null > /dev/null 2>&1
+ fi
+
+ return 0
+}
+
+check_header() {
+ local type=$([ "$1" = "raiddisk" ] && echo "DID" || echo "DEV")
+ echo "${type}|$(parse_smart_info header)|$(parse_smart_status header)"
+ return 0
+}
+
+check_disk() {
+ if [ "$1" = "header" ]; then
+  check_header disk
+  return 0
+ fi
+
+ local devs=$([ -z "$1" ] && echo "" || ls $1 2>/dev/null)
+ if [ -z "$devs" ]; then
+  devs=$(ls /dev/sd* -lah | grep -vE "[0-9]$" | awk '{ print $NF; }' | xargs)
+ fi
+
+ local output=$(echo "${@:-1}" | grep -oE -m1 "(stat|raw)")
+ local quiet=$([ "${@:$#}" = "q" ] && echo "Y" || echo "N")
+ local result=""
+ local data=""
+
+ for d in ${devs}; do
+  [ "$quiet" = "N" ] && echo "Analyzing ${d}..."
+
+  data=$(get_smart_data "$d")
+  [ -z "$data" ] && continue
+
+  result+="\n${d}|${data}"
+ done
+ [ -z "$result" ] && return 1
+ result=$(echo -e "$result" | grep -v "^$")
+
+ if [ "$output" = "raw" ]; then
+  echo "$result"
+ elif [ "$output" = "stat" ]; then
+  echo "$result" | awk -F"|" '{ print $1,$NF; }'
+ else
+  result=$(echo "$result" | awk '{print NR "|" $0}')
+  table_report "NO|$(check_header disk)\n$result" "|"
+ fi
+
+ return 0
+}
+
+check_raiddisk() {
+ if [ "$1" = "header" ]; then
+  check_header raiddisk
+  return 0
+ fi
+
+ local devs=$(smartctl --scan | grep "\-d megaraid," | awk '{ split($3,a,","); print $1,a[2]; }')
+ [ -z "$devs" ] && return 1
+
+ local dids=$(echo "$1" | sed -e "s/[^0-9,-]//g")
+ if [ ! -z "$dids" ]; then
+  if echo "$dids" | grep -q "-"; then
+   num=($(echo "$dids" | tr "-" " "))
+   dids=$(seq ${num[0]} ${num[1]})
+  elif echo "$dids" | grep -q ","; then
+    dids=$(echo "$dids" | tr "," "\n")
+  fi
+ fi
+
+ local output=$(echo "${@:-1}" | grep -oE -m1 "(stat|raw)")
+ local quiet=$([ "${@:$#}" = "q" ] && echo "Y" || echo "N")
+ local result=""
+ local data=""
+ while read -r line; do
+  dev=(${line})
+  if [ -n "$dids" ]; then
+   if ! echo "$dids" | grep -q "${dev[1]}"; then
+    continue
+   fi
+  fi
+
+  [ "$quiet" = "N" ] && echo "Analyzing ${dev[0]} -d megaraid,${dev[1]}..."
+  data=$(get_smart_data "${dev[0]}" "${dev[1]}")
+  [ -z "$data" ] && continue
+
+  result+="\n${dev[1]}|${data}"
+ done <<< "$devs"
+ [ -z "$result" ] && return 1
+ result=$(echo -e "$result" | grep -v "^$")
+
+ if [ "$output" = "raw" ]; then
+  echo "$result"
+ elif [ "$output" = "stat" ]; then
+  echo "$result" | awk -F"|" '{ print $1,$NF; }'
+ else
+  result=$(echo "$result" | awk '{print NR "|" $0}')
+  table_report "NO|$(check_header raiddisk)\n$result" "|"
+ fi
+
+ return 0
+}
+
+check_nvme() {
+ local header="Dev|Model|Serial|Size|Used|Sector|CRITICAL|TEMP|LIFE|HEALTH"
+ if [ "$1" = "header" ]; then
+  echo "$header"
+  return 0
+ fi
+
+ local nvme_data=$(nvme list --output-format=json | jq '."Devices"' | jq -c '.[]'\
+  | jq -c '{"DevicePath","ModelNumber","SerialNumber","PhysicalSize","UsedBytes","SectorSize"}' | sed -E 's/" |"|\{|\}//g' 2>/dev/null\
+  | awk -F"," 'function aaf(n) {r="";cmd="numfmt --to=iec --format \"%.1f\" "n;cmd | getline r;close(cmd);sub(".0","",r);return r"B";}\
+   { for(i=1;i<NF+1;i++) {split($i,a,":"); p=a[2]; if(p=="null") p="-"; else if(i==4||i==5) p=aaf(p); printf "%s|",p; }; printf "\n";}')
+ [ -z "$nvme_data" ] && return 1
+
+ local output=$(echo "${@:-1}" | grep -oE -m1 "(stat|raw)")
+ local quiet=$([ "${@:$#}" = "q" ] && echo "Y" || echo "N")
+ local result=""
+ while read -r line; do
+  dev=$(echo "$line" | cut -d"|" -f1)
+  [ "$quiet" = "N" ] && echo "Analyzing ${dev}..."
+
+  smart_data=$(nvme smart-log ${dev} 2>/dev/null)
+  health="GOOD"
+  for k in critical_warning temperature percentage_used; do
+   v=$(echo "$smart_data" | grep -i "^${k}" | cut -d":" -f2 | grep -oE -m1 "[0-9]+")
+   if [ -z "$v" ]; then
+    line+="-|"
+   else
+     case "${k}" in
+     critical_warning)
+     max_val="0"
+     ;;
+     temperature)
+     max_val="60"
+     ;;
+     percentage_used)
+     max_val="90"
+     ;;
+     esac
+     [ "${v}" -gt "$max_val" ] && health="BAD"
+     [ "$k" = "percentage_used" ] && v=$((100-v))
+    line+="${v}|"
+   fi
+  done
+  line+="${health}|"
+  result+="\n${line}"
+ done <<< "$nvme_data"
+ [ -z "$result" ] && return 1
+ result=$(echo -e "$result" | grep -v "^$")
+
+ if [ "$output" = "raw" ]; then
+  echo "$result"
+ elif [ "$output" = "stat" ]; then
+  echo "$result" | awk -F"|" '{ print $1,$NF; }'
+ else
+  result=$(echo "$result" | awk '{print NR "|" $0}')
+  table_report "NO|${header}\n$result" "|"
+ fi
+
+ return 0
+}
+
+map_disk() {
+ local devs=$(echo "$1" | grep -q "^/dev/" && echo "$1" || echo "/dev/.*")
+ local output=$(echo "${@:$#}" | grep -oE -m1 "(zfs|raw)")
+
+ local items="PATH,TYPE,SIZE,MODEL,FSTYPE,MIN-IO,OPT-IO,PHY-SEC,LOG-SEC,RQ-SIZE,WWN"
+ local json_data=$(lsblk --json -o ${items} | jq '."blockdevices"[]' | jq_filter $(echo "${items,,}" | sed 's/\,/|/g') | jq_data)
+ local fdisk_map=$(fdisk -l 2>/dev/null | grep -A4 -E "^Disk ${devs}:" | awk '{$1=$1};1' | sed 's/^--$/|/g' | tr '\n' '`')
+ [ -z "$fdisk_map" ] && return 1
+
+ local wwn_map=$(ls -l /dev/disk/by-id/wwn* 2>/dev/null)
+ local result=""
+ local line_data=""
+ oIFS="$IFS"; IFS="|"
+ for data in ${fdisk_map}; do
+  data=$(echo "$data" | tr '`' '\n')
+  d=$(echo "$data" | grep "^Disk /dev/" | sed -e 's/[:|,]//g')
+  echo "$d" | grep -q "/dev/loop" && continue
+  wwn=$(echo "$wwn_map" | grep "/$(echo "$d" | awk '{ split($2,a,"/"); print a[length(a)]; }')$" | grep -oE -m1 "/dev/[^ ]*" | awk -F"/" '{ print $NF; }')
+  [ -z "$wwn" ] && wwn="-"
+  line_data=$(echo "$d" | awk -v wwn="${wwn}" '{u=$4;sub("i","",u);if($4=="TiB"){s=10**12}else if($4=="GiB"){s=10**9}else if($4=="MiB"){s=10**6}else if($4=="KiB"){s=10**3}else{s=1};x=$5/s;printf "%s|%s|%s%s|%.1f%s|",$2,wwn,$3,$4,x,u; }')
+  for d in m u s i; do
+   case "$d" in
+    "m")
+    v=$(echo "$data" | grep "^Disk model" | cut -d":" -f2- | xargs)
+    ;;
+    "u")
+    v=$(echo "$data" | grep "^Units" | cut -d"=" -f2 | sed 's#[^0-9]##g' | xargs)
+    ;;
+    "s")
+    v=$(echo "$data" | grep "^Sector size" | cut -d":" -f2 | sed 's#[^0-9/]##g' | xargs)
+    ;;
+    "i")
+    v=$(echo "$data" | grep "^I/O size" | cut -d":" -f2 | sed 's#[^0-9/]##g' | xargs)
+    ;;
+   esac
+   line_data+=${v:--}"|"
+  done
+  result+="\n${line_data}"
+ done
+ IFS="$oIFS"
+ result=$(echo -e "$result" | grep -v "^$" | awk -F"|" '{ printf "%s|%s|%s|%s|%s|%s|%s|%s|\n",$1,$5,$4,$3,$6,$7,$8,$2; }' | sort -t '|' -k1)
+
+ if [ "$output" = "raw" ]; then
+  echo "$result" | sed 's/|$//'
+ elif [ "$output" = "zfs" ]; then
+  if [ -z "$wwn_map" ]; then
+   echo "> No disks for zfs found"
+   return 1
+  fi
+  local wwn_data=$(echo "$result" | grep "|wwn-" | awk -F"|" '{ print $(NF-2)" "$(NF-1); }')
+  local byte=$(echo "$wwn_data" | awk '{split($1,a,"/"); if(a[2]!=""&&(min==""||a[2]<min)){min=a[2]};} END {print min;}')
+  local ashift=""
+  for i in 9 12 13; do
+   p=$((2**$i))
+   if [ "$p" = "$byte" ]; then
+    ashift="$i"
+    break;
+   elif [[ "$p" -gt "$byte" ]]; then
+    ashift="$((i-1))"
+    break
+   fi
+  done
+  wwn_data=$(echo "$wwn_data" | awk '{ print $NF; }' | xargs)
+  printf "ashift=%s %s\n" "$ashift" "$wwn_data"
+ else
+  result=$(echo "$result" | awk '{print NR "|" $0}')
+  result=$(printf "NO|Dev|Model|Size|IEC Size|Unit|Sector|I/O|WWN\n%s\n" "$result")
+  table_report "$result" "|"
+ fi
+
+ return 0
+}
+
+map_raid() {
+ local output=$(echo "${@:$#}" | grep -oE -m1 "(vd|raw)")
+ local json_data=$(storcli64 /call show J 2>/dev/null)
+ [ -z "$json_data" ] && return 1
+
+ local result=""
+ local pd_items="EID:Slt|DID|Model|Size|SeSz|Med|Intf|State"
+ local c=0
+ local pds=""
+ local cdata=""
+ for i in $(seq 0 5); do
+  cdata=$(echo "$json_data" | jq ".Controllers[$i]" 2>/dev/null)
+  if [ -z "$cdata" ] || [ "$cdata" = "null" ]; then
+   break
+  fi
+  cid=$(echo "$cdata" | jq '."Command Status"."Controller"')
+  pds=$(echo "$cdata" | jq '."Response Data"."PD LIST"[]' 2>/dev/null | jq_filter ${pd_items} | jq_data)
+  result+="\n"$(echo "$pds" | awk -v cid=$cid 'function aaf(s) {r="-|-"; if(index(s,":")==0) return r;\
+   split(s,a,":");if(a[1]=="")a[1]="-";if(a[2]=="")a[2]="-"; r=a[1]"|"a[2]; return r;} BEGIN {FS="|";OFS="|";} {$1=aaf($1); print cid,$0; }')
+ done
+
+ result=$(echo -e "$result" | grep -v "^$")
+ [ -z "$result" ] && return 1
+
+ if [ "$output" = "raw" ]; then
+  echo "$result" | sed 's/|$//'
+ else
+  if [ "$output" = "vd" ]; then
+   result=$(echo "$result" | sort -n -t '|' -k1 -k2 -k3)
+  else
+   result=$(echo "$result" | sort -n -t '|' -k4)
+  fi
+  result=$(echo "$result" | awk '{print NR "|" $0}')
+  result=$(printf "NO|CID|EID|SID|DID|Model|Size|Sector|Media|Type|State\n%s\n" "$result")
+  table_report "$result" "|"
+ fi
+
+ return 0
+}
+
+map_vd() {
+ local vd_items="CID|VID|DG|Disks|Span Depth|Number of Drives Per Span|Access|Read Policy|IO Policy|Disk Cache Policy|Write Cache(initial setting)"
+ vd_items+="|OS Drive Name|TYPE|Size|Strip Size|On Disks|Msng Disks|Active Operations|Consist|State"
+
+ if [ "$1" = "header" ]; then
+  echo "$vd_items" | sed -e 's/(.*)//g' -e 's/ Depth//g;s/Number of Drives //;s/ Policy//g;s/Active //g;s/ Size//g;s/OS Drive Name/Dev/;'
+  return 0
+ fi
+
+ local vds=$(echo "$1" | grep -E "^[0-9]+( [0-9]+)? [0-9]+$")
+ [ -z "$vds" ] && return 1
+
+ local pd_items=""
+ if [ "$2" = "pdlist" ]; then
+  pd_items="EID:Slt|DID|Model|Size|SeSz|Med|Intf|State"
+ fi
+
+ local vd_result=""
+ while read -r line; do
+  arr=($line)
+  [ "${#arr[@]}" -lt "2" ] && contine
+
+  cid="${arr[0]}"
+  dg="${arr[1]}"
+  if [ -z "$cid" ] || [ -z "$dg" ]; then
+   contine
+  fi
+  vid="${arr[2]}"
+  [ -z "$vid" ] && vid="$dg"
+
+  json_vd=$(storcli64 /c${cid}/v${vid} show all J 2>/dev/null)
+  r_d=$(echo "$json_vd" | jq ".Controllers[0]" 2>/dev/null | jq '."Response Data"' 2>/dev/null)
+  [ -z "$r_d" -o "$r_d" = "null" ] && continue
+
+  pds=$(echo "$r_d" | jq -c '."PDs for VD '${vid}'"[]')
+  cnt=$(echo "$pds" | wc -l)
+  if [ -z "$pd_items" ]; then
+   pds=""
+  else
+   pds=$(echo "$pds" | jq_filter ${pd_items} | jq_data | sed 's/ :/-:/g;s/:/|/g;')
+  fi
+
+  stat=$(echo "$r_d" | jq -c '."/c'${cid}'/v'${vid}'"[0]')
+  prop=$(echo "$r_d" | jq -c '."VD'${vid}' Properties"')
+  cache=$(jq_data "$(echo "$stat" | jq -c '{"Cache"}')")
+  rp=$([ "${cache:0:2}" = "NR" ] && echo "No Read Ahead" || echo "Read Ahead")
+  ip=$([ "${cache: -1}" = "D" ] && echo "Direct IO" || echo "Cached IO")
+  dsks=( $(jq_data "$(echo "$prop" | jq -c '{"Span Depth","Number of Drives Per Span"}')" | tr '|' ' '))
+  dsks=$(echo $((dsks[0]*dsks[1])))
+  [ "$dsks" = "0" ] && dsks="$cnt"
+  msng=$(echo $((dsks-cnt)))
+
+  new='{"CID":"'${cid}'","VID":"'${vid}'","DG":"'${dg}'","Disks":"'${dsks}'","On Disks":"'${cnt}'","Msng Disks":"'${msng}'","Read Policy":"'${rp}'","IO Policy":"'${ip}'"}'
+  vd_result+="\n"$(echo "${new} ${stat} ${prop}" | jq -s add | jq_filter ${vd_items} | jq_data)
+  [ -n "$pds" ] && vd_result+="\n""$(echo "$pds" | awk -v ref="${cid}|${vid}" '{ print "#" ref "|" $0; }')"
+ done <<< "$vds"
+ vd_result=$(echo -e "$vd_result" | sed "s/'//g" | grep -v "^$")
+
+ echo "$vd_result"
+ return 0
+}
+
+stat_raid() {
+ local output=$(echo "${@:$#}" | grep -oE -m1 "(stat|report|raw)")
+ local json_data=$(storcli64 /call show J 2>/dev/null)
+ [ -z "$json_data" ] && return 1
+
+ local state_report=""
+ local raid_info=""
+ local ctrl_info=""
+ local topology_data=""
+ local vd_data=""
+ local pd_data=""
+ local enclosure_data=""
+ local cachevalut_data=""
+
+ local raid_info_items="Drive Groups|Virtual Drives|Physical Drives|Enclosures"
+ local ctrl_info_items="Product Name|Mfg. Date|FW Package Build|Driver Version|Device Interface|Bus Number"
+ local topology_items="Type|DG|Arr|Row|DID|EID:Slot|BT|Size|State"
+ local enclosure_items="EID|ProdID|Slots|PD|Port#|State"
+ local cachevalut_items="Model|RetentionTime|MfgDate|Mode|Temp|State"
+ local pd_items="DG|EID:Slt|DID|Model|Size|SeSz|Med|Intf|State"
+
+ for i in $(seq 0 5); do
+  cdata=$(echo "$json_data" | jq ".Controllers[$i]" 2>/dev/null)
+  if [ -z "$cdata" ] || [ "$cdata" = "null" ]; then
+   break
+  fi
+
+  comm_status=$(echo "$cdata" | jq '."Command Status"' | jq_filter "Controller|Status|Description" | jq_data)
+  if echo "$comm_status" | grep -q "No Controller found"; then
+   break
+  fi
+
+  cid=$(echo "$comm_status" | cut -d"|" -f1)
+  comm_status=$(echo "$comm_status" | cut -d"|" -f2)
+
+  r_d=$(echo "$cdata" | jq '."Response Data"')
+  ctrl_info+="\n${cid}|"$(echo "$r_d" | jq_filter ${ctrl_info_items} | jq_data)
+  raid_info+="\n${cid}|"$(echo "$r_d" | jq_filter ${raid_info_items} | jq_data)"|${comm_status}"
+
+  if [ "$comm_status" = "Success" ]; then
+   state="$cid|OK"
+   topology=$(echo "$r_d" | jq '."TOPOLOGY"[]' | jq_filter ${topology_items} | jq_data)
+   topology=$(printf "%s\n%s\n" "$(echo "$topology" | grep -v "^DRIVE|")" "$(echo "$topology" | grep "^DRIVE|")")
+   topology_data+="\n"$(echo "$topology" | awk -v cid="$cid" 'function aaf(s) {r="-|-"; if(index(s,":")==0) return r;\
+   split(s,a,":");if(a[1]=="")a[1]="-";if(a[2]=="")a[2]="-"; r=a[1]"|"a[2]; return r;} BEGIN {FS="|";OFS="|";} {$6=aaf($6); print cid,$0}')
+   state+="|"$([ -z "$(echo "$topology" | grep -vE "\|(Onln|Rbld|Optl)$")" ] && echo "OK" || echo "ERR")
+   vd=$(map_vd "$(echo "$r_d" | jq '."VD LIST"[]' | jq_filter "DG/VD" | jq_data | awk -F"/" -v cid="$cid" '{print cid,$1,$2;}')")
+   vd_data+="\n${vd}"
+   pdlist=$(echo "$r_d" | jq '."PD LIST"[]' | jq_filter ${pd_items} | jq_data)
+   pd_data+="\n"$(echo "$pdlist" | awk -v cid="$cid" 'function aaf(s) {r="-|-"; if(index(s,":")==0) return r;\
+    split(s,a,":");if(a[1]=="")a[1]="-";if(a[2]=="")a[2]="-"; r=a[1]"|"a[2]; return r;} BEGIN {FS="|";OFS="|";} {$2=aaf($2); print cid,$0}')
+   enclosure=$(echo "$r_d" | jq '."Enclosure LIST"[]' 2>/dev/null | jq_filter ${enclosure_items} | jq_data)
+   if [ -z "$enclosure" ]; then
+    state+="|-"
+   else
+    enclosure_data+="\n"$(echo "$enclosure" | awk -v cid="$cid" '{print cid "|" $0}')
+    state+="|"$([ -z "$(echo "$enclosure" | grep -v "|OK")" ] && echo "OK" || echo "ERR")
+   fi
+   cachevalut=$(echo "$r_d" | jq '."Cachevault_Info"[]' 2>/dev/null | jq_filter ${cachevalut_items} | jq_data)
+   [ -z "$cachevalut" ] && cachevalut=$(echo "$r_d" | jq -c '."BBU_Info"[]' 2>/dev/null | jq_filter ${cachevalut_items} | jq_data)
+   if [ -z "$cachevalut" ]; then
+    state+="|-"
+   else
+    cachevalut_data+="\n"$(echo "$cachevalut" | awk -v cid="$cid" '{print cid "|" $0}')
+    state+="|"$([ -z "$(echo "$cachevalut" | grep -v "|Optimal")" ] && echo "OK" || echo "ERR")
+   fi
+  else
+   state="$cid|ERR|-|-|-"
+  fi
+  state_report+="\n${state}"
+ done
+
+ state_report=$(echo -e "$state_report" | grep -v "^$")
+ local raid_status=$([ -z "$state_report" ] && echo "None" || (echo "$state_report" | grep -q "ERR" && echo "Error" || echo "Optimal"))
+ if [ "$output" = "stat" ]; then
+  echo "$raid_status"
+  return 0
+ fi
+ [ "$raid_status" = "None" ] && return 0
+
+ topology_data=$(echo -e "$topology_data" | grep -v "^$")
+ pd_data=$(echo -e "$pd_data" | grep -v "^$")
+ enclosure_data=$(echo -e "$enclosure_data" | grep -v "^$")
+ cachevalut_data=$(echo -e "$cachevalut_data" | grep -v "^$")
+
+ local datas=()
+ datas+=("RAID State" "CID|HARDWARE|RAID|ENCLOSURE|CACHEVALUT\n${state_report}")
+
+ if [ -n "$output" ]; then
+  ctrl_info=$(echo -e "$ctrl_info" | grep -v "^$")
+  raid_info=$(echo -e "$raid_info" | grep -v "^$")
+  pd_data=$(echo "$pd_data" | awk '{print NR "|" $0}')
+
+  vd_data=$(echo -e "$(map_vd header)\n$vd_data" | grep -v "^$")
+  local vd_info=$(echo "$vd_data" | cut -d"|" -f1-10)
+  local vd_state=$(echo "$vd_data" | cut -d"|" -f1,2,11-)
+
+  [ -n "$vd_state" ] && datas+=("VD State" "${vd_state}")
+  [ -n "$enclosure_data" ] && datas+=("Enclosure State" "CID|${enclosure_items}\n${enclosure_data}")
+  [ -n "$cachevalut_data" ] && datas+=("CACHEVALUT State" "CID|${cachevalut_items}\n${cachevalut_data}")
+  [ -n "$ctrl_info" ] && datas+=("Controller Info" "CID|Product|Mfg. Date|FW Package|Driver Version|Interface|Bus\n${ctrl_info}")
+  [ -n "$raid_info" ] && datas+=("RAID Info" "CID|${raid_info_items}|Status\n${raid_info}")
+  [ -n "$vd_info" ] && datas+=("VD Info" "${vd_info}")
+  [ -n "$topology_data" ] && datas+=("RAID Topology" "CID|Type|DG|Arr|Row|DID|EID|SID|BGT|Size|State\n${topology_data}")
+  [ -n "$pd_data" ] && datas+=("PD List" "NO|CID|VID|EID|SID|DID|Model|Size|Sector|Media|Type|State\n${pd_data}")
+ fi
+
+ local tp_err=$(echo "$topology_data" | grep -vE "\|(Onln|Rbld|Optl)$")
+ [ -n "$tp_err" ] && datas+=("Error Topology Report" "CID|Type|DG|Arr|Row|DID|EID|SID|BGT|Size|State\n${tp_err}")
+
+ local enc_err=$(echo "$enclosure_data" | grep -v "|OK$")
+ [ -n "$enc_err" ] && datas+=("Error Enclosure Report" "CID|${enclosure_items}\n${enc_err}")
+
+ local cachevalut_err=$(echo "$cachevalut_data" | grep -v "|Optimal$")
+ [ -n "$cachevalut_err" ] && datas+=("Error CacheValut Report" "CID|${cachevalut_items}\n${cachevalut_err}")
+
+ local did_err=$(echo "$tp_err" | awk 'BEGIN {FS="|";OFS="|";} ($6~/[0-9]+/) { print $1,$7,$8,$6; }')
+ if [ -n "$did_err" ]; then
+  local disk_err=""
+  local i=0
+  while read -r line; do
+   bad_did=$(echo "$line" | cut -d"|" -f4 | grep -E "[0-9]+")
+   [ -z "$bad_did" ] && continue
+
+   check=$(check_raiddisk "$bad_did" raw q)
+   [ -z "$check" ] && continue
+
+   let "i+=1"
+   line=$(echo "$line" | cut -d"|" -f1-3)
+   disk_err+="\n${i}|${line}|${check}"
+  done <<< "$did_err"
+
+  if [ -n "$disk_err" ]; then
+   datas+=("Error Disk Check Report" "NO|CID|EID|SID|$(check_header raiddisk)${disk_err}")
+  fi
+ fi
+
+ echo "> RAID Status: $raid_status"
+ for (( i=0; i<${#datas[@]}; i++ )); do
+  if [ $((i%2)) == 0 ]; then
+   echo "> ${datas[i]}"
+  else
+   if [ "$output" = "raw" ]; then
+    echo -e "${datas[i]}"
+   else
+    table_report "${datas[i]}" "|"
+   fi
+  fi
+ done
+
+ return 0
+}
+
+disk_mark() {
+ action_confirm "Choose a target to do speed test" "disk|path" "* Speed Test Target Type"
+ [ -z "$confirm_answer" ] && return 1
+
+ local t_pid=""
+ testing() {
+  i=1; sp="/-\|"
+  echo -n 'Testing '
+  while true; do
+   sleep 0.5
+   #printf "\b${sp:i++%${#sp}:1}"
+   echo -n .
+  done
+ }
+
+ local raw_result=""
+ if [ "$confirm_answer" = "disk" ]; then
+  local t_map=$(map_disk)
+  echo "$t_map"
+  action_confirm "Type a number of target disk" "filter:[0-9]+"
+  [ -z "$confirm_answer" ] && return 1
+
+  local t_disk=$(echo "$t_map" | grep "^$confirm_answer " | awk '{ print $2; }')
+  if [ -z "$t_disk" ] || [ -z "$(ls $t_disk 2>/dev/null)" ] ; then
+   echo "> You typed wrong number"
+   return 1
+  fi
+
+  action_confirm "Choose a test tool for disk speed" "fio|hdparm"
+  [ -z "$confirm_answer" ] && return 1
+
+  if [ "$confirm_answer" = "hdparm" ]; then
+   testing &
+   t_pid="$!"
+   raw_result=$(hdparm -Ttv "$t_disk" 2>/dev/null)
+   kill "$t_pid"
+   echo
+   echo "The hdparm test result for $t_disk"
+   raw_result=$(echo "$raw_result" | grep -E "^ Timing (cached|buffered disk) reads:" | sed 's/^ Timing //g;s/ disk//g;')
+   echo "$raw_result" | awk -F":" '{ split($2,a,"="); print $1": "a[2]; }'
+  fi
+ fi
+
+
+ return 0
+}
+
+manage_bcache() {
+ # https://www.kernel.org/doc/html/latest/admin-guide/bcache.html
+ # https://wiki.archlinux.org/title/Bcache
+ exists apt || return 1
+ if ! exists bcache-super-show; then
+  apt -y install bcache-tools
+ fi
+
+ local bcaches= bcache_map= cset_map= action_list= report=
+ bcache_init() {
+  bcaches=""
+  bcache_map=$(ls -l /sys/block/*/bcache/dev 2>/dev/null | sed 's#/sys/block/#|#g' | cut -d"|" -f2 | awk -F"/" '{ if($1!=$NF) print $1,$NF; }';\
+  ls -l /sys/block/*/*/bcache/dev 2>/dev/null | sed 's#/sys/block/#|#g' | cut -d"|" -f2 | awk -F"/" '{ print $2,$NF; }')
+  cset_map=$(ls -l /sys/fs/bcache/*/{cache?,bdev?} 2>/dev/null | sed 's#/sys/fs/bcache/#|#g;s# ->.*devices/#/#g' | cut -d"|" -f2 | awk -F"/" '{ print $1,$2,$(NF-1); }')
+
+  while read -r line; do
+   read bdev bcache <<< "$line"
+   [ -z "$bdev" -o -z "$bcache" ] && continue
+   echo -e "$bcaches" | grep -q "^$bcache|" && continue
+
+   cset_uuid=$(echo "$cset_map" | grep " ${bdev}$" | cut -d" " -f1)
+   if [ -z "$cset_uuid" ]; then
+    cset_uuid="-"
+    bdevs="$bdev"
+    caches=""
+    status="error"
+   else
+    bdevs=$(echo "$cset_map" | grep "^${cset_uuid} bdev" | cut -d" " -f3 | paste -sd ",")
+    caches=$(echo "$cset_map" | grep "^${cset_uuid} cache" | cut -d" " -f3 | paste -sd ",")
+    status=$([ "$(cat /sys/block/${bcache}/bcache/running 2>/dev/null)" = "1" ] && echo "on" || echo "off")
+   fi
+   [ -z "$bdevs" ] && continue
+   [ -z "$caches" ] && caches="-"
+
+   state=$(cat /sys/block/${bcache}/bcache/state 2>/dev/null)
+
+   bcaches+="\n$bcache|$cset_uuid|$bdevs|$caches|$status|$state"
+  done <<< "$bcache_map"
+  bcaches=$(echo -e "$bcaches" | grep -v "^$")
+
+  report=""
+  action_list="create bcache"
+  if [ -z "$bcaches" ]; then
+   echo "> No bcache disks"
+  else
+   action_list+="|view bcache|edit bcache|format bcache|destroy bcache|clean cache|attach cache|detach cache|tune raid"
+   report=$(echo -e "bcache|cset uuid|backing device|cache device|status|state\n${bcaches}")
+   table_report "$report" "|"
+  fi
+
+  return 0
+ }
+
+ local bcache= device= partitons= cset_uuid= bdevs= caches= status= state= cache_mode= dirty_data= sequential_cutoff= block_size= bucket_size=
+ bcache_infos() {
+  local target=$(echo "$1" | grep -oE "^bcache[0-9]+$")
+  [ -z "$target" ] && return 1
+
+  local target_data=$(echo "$bcaches" | grep "^${target}|" | tr '|' ' ')
+  [ -z "$target_data" ] && return 1
+
+  read bcache cset_uuid bdevs caches status state <<< "$target_data"
+
+  device="/dev/$bcache"
+  cache_mode=$(cat /sys/block/${bcache}/bcache/cache_mode 2>/dev/null | sed -r 's/.*\[([^\]*)\].*/\1/' | grep -v '\[')
+  dirty_data=$(cat /sys/block/${bcache}/bcache/dirty_data 2>/dev/null)
+  sequential_cutoff=$(cat /sys/block/${bcache}/bcache/sequential_cutoff 2>/dev/null)
+  writeback_percent=$(cat /sys/block/${bcache}/bcache/writeback_percent 2>/dev/null)
+  block_size=$(cat /sys/block/${bcache}/queue/physical_block_size 2>/dev/null)
+  #block_size=$(cat /sys/fs/bcache/${cset_uuid}/block_size 2>/dev/null)
+  bucket_size=$(cat /sys/fs/bcache/${cset_uuid}/bucket_size 2>/dev/null)
+  partitons=$(blkid | grep -E "^${device}(p[0-9]+)?:" | grep " TYPE=" | sed -r 's/://;s/([^ ]*).* TYPE="([^"]*).*/\1 \2/'\
+  | awk 'function sf(d) {r="";cmd="numfmt --to=si --format \"%.1f\" $(lsblk -n -b -o SIZE "d")";cmd | getline r;close(cmd);sub(".0","",r);return r"B";}\
+   { print $1"("sf($1)"/"$2")"; }' | paste -sd ",")
+ }
+
+ bcache_wipeout() {
+  local target_block=$(echo "$1" | grep -v "loop")
+  if [ -n "$target_block" ]; then
+   target_block=$(echo "$target_block" | grep -q "^/dev/" && ls "$target_block" 2>/dev/null || ls "/dev/$target_block" 2>/dev/null)
+  fi
+  [ -z "$target_block" ] && return 1
+
+  local kname=$(echo "$target_block" | sed 's#/dev/##')
+  local block_device=$(lsblk -no pkname,kname "/dev/$kname" 2>/dev/null | grep " $kname$" | xargs | cut -d" " -f1)
+  [ -z "$block_device" ] && return 1
+  block_device="/dev/$block_device"
+
+  local ls_blk=$(lsblk -no type,kname,pkname "$block_device" | awk '{$1=$1}1')
+  if echo "$ls_blk" | grep -q "^part "; then
+   action_confirm "There seems data on [$block_device]. Proceed to wipe out?"
+   [ "$confirm_answer" != "y" ] && return 1
+  fi
+
+  for t_b in $(echo "$ls_blk" | grep -E "^disk bcache[0-9]+ " | cut -d" " -f2 | xargs); do
+   if [ -f "/sys/block/${t_b}/bcache/stop" ]; then
+    echo 1 > /sys/block/${t_b}/bcache/stop 2>/dev/null || return 1
+    sleep .5
+   fi
+  done
+
+  for t_p in $(blkid | grep "^$block_device.*TYPE=\"bcache\"" | cut -d":" -f1 | xargs); do
+   cset=$(bcache-super-show ${t_p} 2>/dev/null | grep "^cset.uuid" | awk '{ print $NF; }' | xargs)
+   [ -z "$cset" ] && continue
+   if [ -f "/sys/fs/bcache/${cset}/stop" ]; then
+    echo 1 > /sys/fs/bcache/${cset}/stop 2>/dev/null || return 1
+     sleep .5
+   fi
+  done
+
+  if wipefs -a ${block_device} >/dev/null 2>&1; then
+   parted --script ${block_device} mklabel gpt 2>/dev/null && return 0
+  fi
+
+  return 1
+ }
+
+ bcache_format() {
+  local target_disk=$(echo "$1" | grep "^/dev/")
+  if [ -z "$target_disk" ]; then
+   [ -z "$device" ] && return 1
+   target_disk="$device"
+  fi
+
+  action_confirm "Would you like to format [$target_disk]?"
+  [ "$confirm_answer" != "y" ] && return 1
+
+  if blkid | grep -qE "^${target_disk}(p)?([0-9]+)?:"; then
+   action_confirm "There seems data on [$target_disk]. Proceed to format?"
+   [ "$confirm_answer" != "y" ] && return 1
+  fi
+
+  action_confirm "Select file system" "ext4|xfs" "* FS type"
+  [ -z "$confirm_answer" ] && return 1
+  local target_fs="$confirm_answer"
+
+  if mount | grep -q "$target_disk"; then
+   umount "$target_disk" 2>/dev/null || return 1
+  fi
+  bcache_wipeout "$target_disk" || return 1
+  parted --script ${target_disk} mkpart parimary 0% 100%
+  sleep .5
+
+  local target_part=$(blkid | grep -E "^${target_disk}(p)?1:" | cut -d":" -f1)
+  [ -z "$target_part" ] && return 1
+
+  mkfs -t ${target_fs} ${target_part} || return 1
+
+  action_confirm "Would you like to mount [$target_disk]?"
+  [ "$confirm_answer" != "y" ] && return 0
+
+  local stor_suffix=$(hostname | grep -oiE "\-fs[0-9]+$" | cut -d"-" -f2- | tr '[:lower:]' '[:upper:]')
+  if [ -z "$stor_suffix" ]; then
+   stor_suffix="FS1"
+  else
+   stor_suffix=${stor_suffix^^}
+  fi
+
+  local mount_path="/Volumes/$stor_suffix"
+  if mount | grep -q " $mount_path "; then
+   mount_path=""
+  else
+   action_confirm "Would you like to use [$mount_path] as mount path?"
+   [ "$confirm_answer" != "y" ] && mount_path=""
+  fi
+
+  if [ -z "$mount_path" ]; then
+   action_confirm "Type a mount path" "filter:^/[a-z0-9_-]+(/)?.*"
+   [ -z "$confirm_answer" ] && return 0
+   mount_path="$confirm_answer"
+  fi
+
+  action_confirm "Would you like to mount [$target_disk] on [$mount_path]?"
+  [ "$confirm_answer" != "y" ] && return 0
+
+  mkdir -p "$mount_path"
+  if mount -t ${target_fs} ${target_part} "${mount_path}" 2>/dev/null; then
+   local user_name=$(logname | xargs)
+   if [ -n "$user_name" ]; then
+    chown -R $user_name:$user_name "${mount_path}"
+   fi
+
+   echo "> [$target_disk] successfully mounted on [$mount_path]"
+   action_confirm "Would you like to register this mount info to fstab?"
+   [ "$confirm_answer" != "y" ] && return 0
+
+   local uuid=$(blkid | grep "^${target_part}:" | sed -r 's/.* UUID="([^"]*)".*/\1/' | grep -v "UUID")
+   [ -z "$uuid" ] && return 0
+
+   local ex_num=$(cat /etc/fstab | grep -m1 -n "^UUID=.* ${mount_path} " | cut -d":" -f1 | xargs)
+   [ -n "$ex_num" ] && sed -i "${ex_num}d" /etc/fstab
+
+   echo "UUID=${uuid} ${mount_path} ${target_fs} defaults,nofail,x-systemd.device-timeout=9 0 0" >> /etc/fstab
+  fi
+
+  return 0
+ }
+
+ bcache_raid_tune() {
+  local target_disk=$(echo "$1" | grep -v "loop")
+  if [ -z "$target_disk" ]; then
+   target_disk=$(echo "$bdevs" | cut -d"," -f1 | xargs)
+  fi
+  target_disk=$(echo "$target_disk" | grep -q "^/dev/" && ls "$target_disk" 2>/dev/null || ls "/dev/$target_disk" 2>/dev/null)
+  [ -z "$target_disk" ] && return 1
+
+  local kname=$(echo "$target_disk" | sed 's#/dev/##')
+  local block_device=$(lsblk -no pkname,kname "/dev/$kname" 2>/dev/null | grep " $kname$" | xargs | cut -d" " -f1)
+  [ -z "$block_device" ] && return 1
+  block_device="/dev/$block_device"
+
+  local vendor=$(cat /sys/block/$(echo "$block_device" | sed 's#/dev/##')/device/vendor 2>/dev/null | xargs)
+  if [ "$vendor" != "LSI" ]; then
+   echo "> Currently raid tune for bcache only supports LSI Megaraid"
+   return 0
+  fi
+
+  local vd_map=$(storcli64 /call/vall show all | grep -E "^(/c[0-9]+/v[0-9]+ :|OS Drive Name =)"\
+   | tr '\n' '|' | sed 's/ :|OS Drive Name = / /g' | tr '|' '\n' | grep "${block_device}$")
+
+  local cvid=$(echo "$vd_map" | sed -r 's#/c([0-9]+)/v([0-9]+).*#\1 \2#' | grep -v "/")
+  read cid vid <<< "$cvid"
+  if [ -n "$cid" -a -n "$vid" ]; then
+   local r_d=$(storcli64 /c${cid}/v${vid} show all J | jq '."Controllers"[0]' | jq '."Response Data"')
+   local vd_cache=$(echo "$r_d" | jq '."/c'${cid}'/v'${vid}'"[0]."Cache"' | sed 's/"//g')
+   rdcache=$([ "${vd_cache:0:2}" = "NR" ] && echo "nora" || echo "ra")
+   iopolicy=$([ "${vd_cache: -1}" = "D" ] && echo "direct" || echo "cached")
+   #wrcache=$(echo "${vd_cache}" | grep -q "AWB" && echo "awb" || (echo "${vd_cache}" | grep -q "WT" && echo "wt" || echo "wb"))
+
+   local vd_prop=$(echo "$r_d" | jq '."VD'${vid}' Properties"' | jq -c '{"Disk Cache Policy","Write Cache(initial setting)"}'\
+   | sed -r 's/.*:"([^"]*)",.*:"([^"]*)".*/\1 \2/' | grep -v "{")
+   pdcache=$([ "$(echo "$vd_prop" | awk '{ print tolower($1); }')" = "enabled" ] && echo "on" || echo "off")
+   wrcache=$(echo "$vd_prop" | awk '{ print tolower(substr($0,index($0,$2))); }' | sed 's/write/w/;s/back/b/;s/through/t/;s/always/a/;s/ //g')
+
+   local cur_val="$rdcache $wrcache $iopolicy $pdcache"
+   report=$(echo -e "RAID Disk|Vendor|Read Policy|Write Policy|IO Policy|Disk Cache\n${block_device}|${vendor}|$(echo "$cur_val" | tr ' ' '|')")
+
+   echo "* Current Raid Backing Disk Cache Status"
+   table_report "$report" "|"
+
+  local tuned_val=$(echo "rdcache=ra|wrcache=wb|iopolicy=direct|pdcache=on" | tr '|' '\n')
+   if [ "$cur_val" != "$(echo "$tuned_val" | cut -d= -f2 | xargs)" ]; then
+    action_confirm "Would you like to optimize raid disk cache for bcache?"
+    if [ "$confirm_answer" = "y" ]; then
+     for i in rdcache wrcache iopolicy pdcache; do
+      cv="${!i}"
+      tv=$(echo "$tuned_val" | grep "^$i=" | cut -d"=" -f2)
+      [ "$cv" = "$tv" ] && continue
+      storcli64 /c${cid}/v${vid} set $i=${!i} >/dev/null 2>&1
+     done
+     echo "> Raid tuning for bcache has been done"
+    fi
+   fi
+  fi
+
+  return 0
+ }
+
+ bcache_create() {
+  action_confirm "Would you like to create bcache device?"
+  [ "$confirm_answer" != "y" ] && return 1
+
+  local lsblk_data=$(lsblk -nbo kname,size,pkname,type | awk '{$1=$1}1' | grep " disk$")
+  local used=$(echo "$lsblk_data" | awk 'NF>3 { print "/dev/"$3; }')
+  local mounted=$(mount | grep "^/dev/" | cut -d" " -f1)
+
+  local disk_list=""
+  while read -r line;do
+   read kname size type <<< "$line"
+   [ "$type" != "disk" ] && continue
+   dev="/dev/$kname"
+   echo "$used" | grep -q "^$dev" && continue
+   echo "$mounted" | grep -q "^$dev" && continue
+   size=$(numfmt --to=si --format "%.1f" "$size")
+   model=$(cat /sys/block/${kname}/device/model 2>/dev/null | xargs)
+   disk_list+="\n$dev ($model / $size)"
+  done <<< "$lsblk_data"
+  disk_list=$(echo -e "$disk_list" | grep -v "^$")
+
+  local target_disks=$(echo "$disk_list" | grep -v "^/dev/nvme")
+  if [ -z "$target_disks" ]; then
+   echo "> There is no available backing disk to create bcache"
+   return 1
+  fi
+  action_confirm "Select backing disk" "$(echo "$target_disks" | paste -sd "|")" "* Backing Disk"
+  [ -z "$confirm_answer" ] && return 1
+  local backing_disk=$(echo "$confirm_answer" | cut -d" " -f1)
+
+  target_disks=$(echo "$disk_list" | grep -v "^$backing_disk")
+  if [ -z "$target_disks" ]; then
+   echo "> There is no available cache disk for the backing disk"
+   return 1
+  fi
+  action_confirm "Select cache disk" "$(echo "$target_disks" | paste -sd "|")" "* Cache Disk"
+  [ -z "$confirm_answer" ] && return 1
+  local cache_disk=$(echo "$confirm_answer" | cut -d" " -f1)
+
+  action_confirm "[Backing disk: $backing_disk, Cache disk: $cache_disk] Create bcache device?"
+  [ "$confirm_answer" != "y" ] && return 1
+
+  action_confirm "All data on [$backing_disk, $cache_disk] will be erased. Procceed?"
+  [ "$confirm_answer" != "y" ] && return 1
+
+  local backing_lbl=$(echo "$backing_disk" | awk -F"/" '{ print $NF; }')
+  bcache_wipeout "${backing_disk}" || return 1
+  parted --script ${backing_disk} mkpart primary 0% 100%
+  local backing_part=$(lsblk -no pkname,kname "$backing_disk" | awk '{$1=$1}1' | grep "^$backing_lbl " | cut -d" " -f2)
+  [ -z "$backing_part" ] && return 1
+  backing_part="/dev/$backing_part"
+  block_size=$(cat /sys/block/${backing_lbl}/queue/physical_block_size 2>/dev/null)
+  make-bcache -B --wipe-bcache --block ${block_size} ${backing_part} >/dev/null 2>&1
+  sleep .5; echo ${backing_part} > /sys/fs/bcache/register 2>/dev/null
+
+  bcache=$(lsblk -no pkname,kname "$backing_part" 2>/dev/null | awk '{$1=$1}1' | grep "^${backing_part:5} " | cut -d" " -f2)
+  [ -z "$bcache" ] && return 1
+
+  local cache_lbl=$(echo "$cache_disk" | awk -F"/" '{ print $NF; }')
+  bcache_wipeout "${cache_disk}" || return 1
+  parted --script ${cache_disk} mkpart primary 0% 90%
+  local cache_part=$(lsblk -no pkname,kname "$cache_disk" | awk '{$1=$1}1' | grep "^$cache_lbl " | cut -d" " -f2)
+  [ -z "$cache_part" ] && return 1
+  cache_part="/dev/$cache_part"
+  make-bcache -C --wipe-bcache --block ${block_size} --bucket 2M ${cache_part} >/dev/null 2>&1
+  sleep .3; echo ${cache_part} > /sys/fs/bcache/register 2>/dev/null
+
+  cset_uuid=$(bcache-super-show ${cache_part} 2>/dev/null | grep "^cset.uuid" | awk '{ print $NF; }' | xargs)
+  [ -z "$cset_uuid" ] && return 1
+
+  echo "$cset_uuid" > /sys/block/${bcache}/bcache/attach 2>/dev/null || return 1
+
+  echo "> Succeeded to create bcache device on [$device]"
+  bcache_init
+  device="/dev/$bcache"
+  bcache_raid_tune
+  bcache_format
+
+  return 0
+ }
+
+ bcache_detail() {
+  echo -e "\n> [$bcache] details"
+  local infos=""
+  for i in device partitons cset_uuid bdevs caches block_size bucket_size status state dirty_data cache_mode sequential_cutoff writeback_percent; do
+   v=$(echo "${!i}")
+   if [ "$i" = "bdevs" ] || [ "$i" = "caches" ]; then
+    [ "$v" != "-" ] && v=$(echo "$v" | tr ',' '\n' | awk '{ print "/dev/"$1; }' | paste -sd ",")
+    i=$(echo "$i" | sed 's/bdevs/backing_devices/;s/caches/cache_devices/')
+   fi
+   i=$(echo "$i" | tr '_' ' ')
+   [ -z "$v" ] && v="-"
+   infos+="\n$i|$v"
+  done
+  report=$(echo -e "item|value${infos}")
+  table_report "$report" "|"
+ }
+
+ bcache_edit() {
+  bcache_detail
+  action_confirm "Target edit action" "cache_mode|writeback_percent|sequential_cutoff" "* Edit Action Target"
+  local edit_action="$confirm_answer"
+  local select_list=""
+  local select_txt=""
+  local target_val=""
+  case "$edit_action" in
+   cache_mode)
+   select_list="writethrough (sync write)|writeback (async write)|writearound (no write cache)|none"
+   select_txt="Select Write Cache Mode"
+   ;;
+   writeback_percent)
+   select_list="10|20|30|40|50"
+   select_txt="Select Writeback Mode Dirty Data Ratio (%)"
+   ;;
+   sequential_cutoff)
+   select_list="0 (no limit)|1.0M|4.0M|10.0M|50.0M"
+   select_txt="Select Applied Sequential Data Size Limit (caching applied only under this size)"
+   ;;
+   *)
+   return 1
+  esac
+
+  action_confirm "Select $edit_action (current: ${!edit_action})" "$select_list" "* $select_txt"
+  target_val=$(echo "$confirm_answer" | cut -d" " -f1)
+  [ -z "$target_val" -o "$target_val" = "${!edit_action}" ] && return 1
+
+  action_confirm "Would you like to set $bcache [$edit_action] from [${!edit_action}] to [$target_val]?"
+  if [ "$confirm_answer" = "y" ]; then
+   local msg="> $bcache [$edit_action] changed to [$target_val]"
+   if [ "$edit_action" = "sequential_cutoff" ]; then
+    let target_val=$(echo "$target_val" | cut -d"." -f1)*1024*1024
+   fi
+   if echo "$target_val" > /sys/block/${bcache}/bcache/${edit_action} 2>/dev/null; then
+    echo "$msg"
+   fi
+  fi
+
+  return 0
+ }
+
+ bcache_detach() {
+  bcache_detail
+  if [ -z "$caches" -o "$caches" = "-" ]; then
+   echo "> There is no cache deivice on $bcache"
+   return 1
+  fi
+
+  local cache_list=$(echo "$caches" | tr ',' '\n' | awk '{ print "/dev/"$1; }' | paste -sd "|")
+  action_confirm "Select a target cache device to detach" "$cache_list" "* Detach Cache Device"
+  [ -z "$confirm_answer" ] && return 0
+
+  local detach_target="$confirm_answer"
+  action_confirm "Would like to detach [${detach_target}]?"
+  [ "$confirm_answer" != "y" ] && return 0
+
+  action_confirm "Would like to wipe out ${detach_target} after detach?"
+  local wipeout=$([ "$confirm_answer" = "y" ] && echo "y" || echo "n")
+
+  local cache_cset=$(bcache-super-show ${detach_target} 2>/dev/null | grep "^cset.uuid" | awk '{ print $NF; }')
+  [ -z "$cache_cset" -o "$cache_cset" != "$cset_uuid" ] && return 1
+
+  local msg=""
+  if echo "$cache_cset" > /sys/block/${bcache}/bcache/detach 2>/dev/null; then
+   if echo 1 > /sys/fs/bcache/${cset_uuid}/unregister 2>/dev/null; then
+    msg="> Successfully detached"
+    if [ "$wipeout" = "y" ]; then
+     sleep .5
+     if bcache_wipeout "$detach_target"; then
+      msg+=" and wiped out"
+     fi
+    fi
+   fi
+   msg+=" [$detach_target] from $bcache"
+  fi
+
+  if [ -z "$msg" ]; then
+   echo "> Failed to detach [$detach_target] from $bcache"
+  else
+   echo "$msg"
+   bcache_init
+  fi
+
+  return 0
+ }
+
+ bcache_attach() {
+  if [ "$caches" != "-" ]; then
+   echo "> Already has attached cache device"
+   return 1
+  fi
+
+  local mounted=$(mount | grep "^/dev/" | cut -d" " -f1 | xargs)
+  local lsblk_data=$(lsblk -l -b -o name,size,type | grep -vE "^(NAME|loop)")
+  local disk_list=$(echo "$lsblk_data" | grep " disk$" | grep -v "^bcache" | awk -v m="$mounted"\
+   'function sf(n) {r="";cmd="numfmt --to=si --format \"%.1f\" "n;cmd | getline r;close(cmd);sub(".0","",r);return r"B";}\
+   function mf(b) {r="";cmd="cat /sys/block/"b"/device/model | xargs";cmd | getline r;close(cmd);return r;}\
+   { d="/dev/"$1; if(index(m,d)==0) print d" ("mf($1)" / "sf($2)")"; }')
+
+  bdevs=$(echo "$bdevs" | tr ',' '\n'; ls -l /sys/fs/bcache/*/bdev? 2>/dev/null | awk -F"/" '{ print $(NF-1); }')
+  local backing_disk=""
+  while read -r dev; do
+   backing_disk+="\n/dev/"$(lsblk -no pkname,kname "/dev/$dev" 2>/dev/null | grep " $dev$" | xargs | cut -d" " -f1)
+  done <<< "$(echo "$bdevs" | sort -u)"
+  backing_disk=$(echo -e "$backing_disk" | grep -v "^$" | sort -u | xargs)
+
+  action_confirm "Select cache disk" "$(echo "$disk_list" | awk -v b="$backing_disk" ' { if(index(b,$1)==0) print $1; }' | paste -sd "|")" "* Cache Disk"
+  [ -z "$confirm_answer" ] && return 1
+  local cache_disk=$(echo "$confirm_answer" | cut -d" " -f1)
+
+  action_confirm "[Bcache device: $device, Cache disk: $cache_disk] Attach to bcache device?"
+  [ "$confirm_answer" != "y" ] && return 1
+
+  cset_uuid=""
+  local ex_cache=""
+  local cache_part=$(lsblk -no pkname,kname "$cache_disk" 2>/dev/null | awk '{$1=$1}1' | grep -m1 "^${cache_disk:5} " | cut -d" " -f2)
+  if [ -n "$cache_part" ]; then
+   cache_part="/dev/$cache_part"
+   cset_uuid=$(bcache-super-show ${cache_part} 2>/dev/null | grep "^cset.uuid" | awk '{ print $NF; }' | xargs)
+   if [ -n "$cset_uuid" ]; then
+    action_confirm "[$cache_disk] already has bcache partiton. Use the existing bcache partiton?"
+    if [ "$confirm_answer" = "y" ]; then
+     ex_cache="Y"
+     echo ${cache_part} > /sys/fs/bcache/register 2>/dev/null
+    fi
+   fi
+  fi
+
+  if [ -z "$ex_cache" ]; then
+   action_confirm "All data on [$cache_disk] will be erased. Procceed?"
+   [ "$confirm_answer" != "y" ] && return 1
+
+   bcache_wipeout "${cache_disk}" || return 1
+   parted --script ${cache_disk} mkpart primary 0% 90%
+   cache_part=$(lsblk -no pkname,kname "$cache_disk" 2>/dev/null | awk '{$1=$1}1' | grep -m1 "^${cache_disk:5} " | cut -d" " -f2)
+   [ -z "$cache_part" ] && return 1
+   cache_part="/dev/$cache_part"
+
+   block_size=$(cat /sys/block/${bcache}/queue/physical_block_size 2>/dev/null)
+   make-bcache -C --wipe-bcache --block ${block_size} --bucket 2M ${cache_part} >/dev/null 2>&1
+   sleep .5
+   cset_uuid=$(bcache-super-show ${cache_part} 2>/dev/null | grep "^cset.uuid" | awk '{ print $NF; }' | xargs)
+  fi
+  [ -z "$cset_uuid" ] && return 1
+
+  local running=$(cat /sys/block/${bcache}/bcache/running 2>/dev/null)
+  if [ -z "$running" ]; then
+   return 1
+  else
+   echo 1 > /sys/block/${bcache}/bcache/running
+  fi
+
+  if echo "$cset_uuid" > /sys/block/${bcache}/bcache/attach 2>/dev/null; then
+   echo "> Successfully attached $cache_disk to $bcache"
+   bcache_init
+  else
+   echo "> Failed to attach $cache_disk to $bcache"
+   return 1
+  fi
+
+  return 0
+ }
+
+ bcache_destroy() {
+  [ -z "$bcache" -o -z "$device" -o -z "$cset_uuid" -o -z "$bdevs" -o -z "$caches" ] && return 1
+
+  action_confirm "Destroy $bcache?"
+  [ "$confirm_answer" != "y" ] && return 1
+
+  action_confirm "All data on $device will be lost. Really procceed to destroy?"
+  [ "$confirm_answer" != "y" ] && return 1
+
+  local mounted=$(mount | grep -m1 -E "^${device}(p[0-9]+)? " | awk '{ print $3; }')
+  if [ -n "$mounted" ]; then
+   fuser -ck "$mounted"
+   if ! umount "$mounted"; then
+    echo "> Failed to umount $device"
+    return 1
+   fi
+   local line_num=$(grep -m1 -n "$mounted" /etc/fstab | cut -d":" -f1 | xargs)
+   [ -n "$line_num" ] && sed -i "${line_num}d" /etc/fstab
+  fi
+
+  bcache_wipeout "$bcache"
+  echo 1 > /sys/block/${bcache}/bcache/detach 2>/dev/null || return 1
+  if [ -f "/sys/block/${bcache}/bcache/stop" ]; then
+   echo 1 > /sys/block/${bcache}/bcache/stop 2>/dev/null || return 1
+  fi
+
+  local wiped_disk=""
+  local target_devs=$(echo "$bdevs,$caches" | tr ',' '\n' | grep -vE "^(-?)$" | sort -u | xargs)
+  for dev in ${target_devs}; do
+   target_disk=$(lsblk -no pkname,kname "/dev/$dev" 2>/dev/null | grep " $dev$" | xargs | cut -d" " -f1)
+   [ -z "$target_disk" ] && continue
+   target_disk="/dev/$target_disk"
+   echo " $wiped_disk " | grep -q " $target_disk " && continue
+   wiped_disk+=" $target_disk"
+   bcache_wipeout "$target_disk"
+  done
+  wiped_disk=$(echo "$wiped_disk" | xargs | tr ' ' ',')
+
+  echo "> Successfully destroyed [$bcache] wiping out [$wiped_disk]"
+  return 0
+ }
+
+ bcache_init
+ action_confirm "Target action" "$action_list" "* Bacche Manage"
+ [ -z "$confirm_answer" ] && return 0
+
+ local action=$(echo "$confirm_answer" | cut -d" " -f1)
+ if [ "$action" != "create" ]; then
+  action_confirm "Target bcache device for '$action'" "$(echo "$bcaches" | cut -d"|" -f1 | paste -sd "|")" "* Action Target"
+  [ -z "$confirm_answer" ] && return 0
+  bcache_infos "$confirm_answer"
+ fi
+
+ case "$action" in
+  create)
+  bcache_create || echo "> Failed to create bcache device"
+  ;;
+  format)
+  bcache_format
+  ;;
+  view)
+  bcache_detail
+  ;;
+  edit)
+  bcache_edit
+  ;;
+  clean)
+  action_confirm "Would you like clean up [$bcache] writeback dirty data (current dirty data size: $dirty_data)?"
+  if [ "$confirm_answer" = "y" ]; then
+   if echo 0 > /sys/block/${bcache}/bcache/writeback_percent 2>/dev/null; then
+    echo "> $bcache dirty data has been cleaned"
+   fi
+  fi
+  ;;
+  attach)
+  bcache_attach
+  ;;
+  detach)
+  bcache_detach
+  ;;
+  tune)
+  bcache_raid_tune
+  ;;
+  destroy)
+  bcache_destroy
+  ;;
+ esac
+
+ return 0
+}
+
+help() {
+echo "Ellucy Disk Smart Check $VERSION
+Copyright: Jack Nam (jacknam@ellucy.com)
+
+Required:
+storcli, smartctl, nvme, wget, jq
+
+Commands:
+diskcheck (devs) (raw|report)     smart status report of disks
+raiddiskcheck (dids) (raw|report) smart status report of megaraid disks
+nvmecheck                         smart status report of nvme disks
+diskmap (devs)                    disk map by fdisk
+raidmap                           raid disk map by storcli
+raidstat (stat|report|raw)        raid status and check
+locating (/dev/sd[x]|/did/[n])    locate disk via led blinking
+bcache                            manage bcache
+diskmark                          bench mark disk speed
+help                              help usage
+
+Examples:
+estor-disk diskcheck
+estor-disk diskcheck '/dev/sd[a-c]'
+estor-disk raiddiskcheck
+estor-disk raiddiskcheck '25-28'
+estor-disk raiddiskcheck '25,28'
+estor-disk nvmecheck
+estor-disk diskmap
+estor-disk diskmap '/dev/sd[c-j]'
+estor-disk raidmap
+estor-disk raidstat
+estor-disk raidstat report
+estor-disk locating /dev/sdc
+estor-disk locating /did/111
+"
+
+ return 0
+}
+
+install() {
+ local install_type=""
+ if [[ "$(which apt 2>/dev/null)" =~ "apt" ]]; then
+  install_type="apt"
+ elif [[ "$(which yum 2>/dev/null)" =~ "yum" ]]; then
+  install_type="yum"
+ else
+  return 1
+ fi
+
+ if ! exists smartctl; then
+  ${install_type} -y install smartmontools
+ fi
+
+ if ! exists nvme; then
+  ${install_type} -y install nvme-cli
+ fi
+
+ local target_install=""
+ for a in wget jq fio hdparm; do
+  if ! exists $a; then
+   target_install+=" $a"
+  fi
+ done
+ if [ -n "$target_install" ]; then
+   ${install_type} -y install ${target_install}
+ fi
+
+ if [ -z "$(which storcli64 2>/dev/null)" ]; then
+  if [ "$install_type" = "apt" ]; then
+   local file_name="/tmp/storcli_007.1508.0000.0000_all.deb"
+   if [ ! -f "$file_name" ]; then
+    wget -O "$file_name" https://cloud.ellucy.com/s/q4tFYaQXE9BwDA6/download
+   fi
+   dpkg -i "$file_name"
+  else
+   rpm -Uvh https://cloud.ellucy.com/s/M2ikYDXNSKc2HjB/download
+  fi
+  ln -sf /opt/MegaRAID/storcli/storcli64 /usr/local/bin/storcli64
+ fi
+
+ return 0
+}
+
+if ! install; then
+ exit 1
+fi
+
+case "$command" in
+ diskcheck)
+  check_disk "${@:2}"
+  ;;
+ raiddiskcheck)
+  check_raiddisk "${@:2}"
+  ;;
+ nvmecheck)
+  check_nvme "${@:2}"
+  ;;
+ locating)
+  disk_locating "${@:2}"
+  ;;
+ diskmap)
+  map_disk "${@:2}"
+  ;;
+ raidmap)
+  map_raid "${@:2}"
+  ;;
+ raidstat)
+  stat_raid "${@:2}"
+  ;;
+ diskmark)
+  disk_mark "${@:2}"
+  ;;
+ bcache)
+  manage_bcache "${@:2}"
+  ;;
+ help)
+  help
+  ;;
+ *)
+  echo "Ellucy Disk Smart Check $VERSION"
+esac
+
+exit 0
