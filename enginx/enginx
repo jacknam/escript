@@ -1675,7 +1675,7 @@ set_config() {
   valid_limit="extras|full|light|basic"
  elif [ "$mode" = "PREFER_VER" ] && [ -z "$(echo "$value" | grep -oE "^(latest|production)$")" ]; then
   valid_limit="latest|production"
- elif [ "$mode" = "MARIADB_VER" ] && [ -z "$(echo "$value" | grep -oE "^10.[0-9]$")" ]; then
+ elif [ "$mode" = "MARIADB_VER" ] && [ -z "$(echo "$value" | grep -oE "^10.[0-9]+$")" ]; then
   valid_limit="10.x"
  fi
  if [ -n "$valid_limit" ]; then
@@ -1712,8 +1712,8 @@ load_config() {
   PREFER_VER="production"
  fi
 
- if [ -z "$(echo "$MARIADB_VER" | grep -oE "^10.[0-9]$")" ]; then
-  MARIADB_VER="10.4"
+ if [ -z "$(echo "$MARIADB_VER" | grep -oE "^10.[0-9]+$")" ]; then
+  MARIADB_VER="10.11"
  fi
 
 read -r -d '' enginx_conf <<-EOL || true
